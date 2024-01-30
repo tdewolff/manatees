@@ -2,6 +2,8 @@ import os
 import sys
 import time
 import pickle
+import string
+import random
 import argparse
 from datetime import datetime
 import pandas as pd
@@ -19,14 +21,14 @@ parser = argparse.ArgumentParser("manatee training")
 parser.add_argument("--epochs", help="Number of epochs to run training", type=int, default=0)
 parser.add_argument("--split", help="Training/validation split", type=float, default=0.8)
 parser.add_argument("--batch", help="Batch size", type=int, default=16)
-parser.add_argument("-o", help="Output filename for trained model", type=str, default='model.pth')
-parser.add_argument("data", help="Input filename for preprocessed data", type=str, default='data.pkl')
+parser.add_argument("--output", help="Output filename for trained model", type=str, default='model.pth')
+parser.add_argument("data", nargs='*', help="Input filename for preprocessed data", type=str, default=['data.pkl'])
 args = parser.parse_args()
 
 
 # General settings
 DataFilename = args.data
-ModelFilename = args.o
+ModelFilename = args.output
 
 # Data settings
 FreqDims = 128
@@ -40,7 +42,7 @@ BatchSize = args.batch
 LearningRate = 5e-5
 #LearningRateEpochStart = 10
 #LearningRateEpochStop = 1000
-#LearningRateEpochStep = 10
+#LearningRateEpochStep = 5
 #LearningRateDecay = 0.5
 Epochs = args.epochs
 
@@ -167,9 +169,9 @@ def yield_samples(filename_data, metadata):
             'target': torch.nn.functional.one_hot(torch.tensor(cls), 2).numpy(),
         }
 
-if os.path.isfile(DataFilename):
+if len(DataFilename) != 1 or os.path.isfile(DataFilename[0]):
     print('--- Loading preprocessed data')
-    data = pickle.load(open(DataFilename, 'rb'))
+    data = [sample for filename in DataFilename for sample in pickle.load(open(filename, 'rb'))]
 else:
     print('--- Preprocessing data')
     data = []
@@ -183,7 +185,7 @@ else:
         print()
     if DataFilename != '':
         print('--- Saving preprocessed data')
-        pickle.dump(data, open(DataFilename, 'wb'))
+        pickle.dump(data, open(DataFilename[0], 'wb'))
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, data, device=None):
