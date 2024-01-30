@@ -19,11 +19,14 @@ from models import ASTModel
 
 parser = argparse.ArgumentParser("manatee training")
 parser.add_argument("--epochs", help="Number of epochs to run training", type=int, default=0)
-parser.add_argument("--split", help="Training/validation split", type=float, default=0.8)
+parser.add_argument("--split", help="Training/validation split", type=float, default=0.7)
 parser.add_argument("--batch", help="Batch size", type=int, default=16)
 parser.add_argument("--output", help="Output filename for trained model", type=str, default='model.pth')
 parser.add_argument("data", nargs='*', help="Input filename for preprocessed data", type=str, default=['data.pkl'])
 args = parser.parse_args()
+
+
+# TODO: zero bands appear in fbank depending on FreqDims and TimeDims
 
 
 # General settings
@@ -31,9 +34,9 @@ DataFilename = args.data
 ModelFilename = args.output
 
 # Data settings
-FreqDims = 128
-TimeDims = 32
-WindowOverlap = 0.5
+FreqDims = 128       # increases frequency resolution for each sample's fbank
+TimeDims = 32        # increases time resolution for each sample's fbank
+WindowOverlap = 0.5  # increases FFT window size but near time samples look more alike
 PositiveSplit = 0.5
 
 # Training settings
@@ -47,11 +50,11 @@ LearningRate = 5e-5
 Epochs = args.epochs
 
 
-def plot_spectrogram(spectrum):
-    plt.matshow(spectral, aspect='auto', interpolation='nearest', origin='lower')
+def plot_fbank(fbank):
+    plt.matshow(fbank, aspect='auto', interpolation='nearest', origin='lower')
     plt.show()
 
-uniq_id = ''.join(random.choice(string.ascii_lowercase + string.ascii_uppercase) for _ in range(6))
+uniq_id = ''.join(random.choice(string.ascii_lowercase) for _ in range(6))
 def uniq_model_filename():
     if ModelFilename == '':
         return ''
@@ -63,13 +66,14 @@ def uniq_model_filename():
 
 def dur2str(dur):
     out = ''
-    units = ['w', 'd', 'h', 'm', 's']
-    scales = [7*24*3600, 24*3600, 3600, 60, 1]
+    units = ['w', 'd', 'h', 'm']
+    scales = [7*24*3600, 24*3600, 3600, 60]
     for i, unit in enumerate(units):
         n = dur // scales[i]
         if 0 < n:
             out += '%d%s' % (n, unit)
             dur = dur - n*scales[i]
+    out += '%ds' % (int(dur+0.5),)
     return out
 
 def yield_samples(filename_data, metadata):
@@ -97,20 +101,18 @@ def yield_samples(filename_data, metadata):
         else:
             i = i + 1
 
-    num_positive = len(metadata)
+    num_positive = len(samples)
     num_negative = int(float(num_positive)/PositiveSplit + 0.5) - num_positive
 
     # get negative samples randomly
-    lengths = [b-a for (_, _, a, b) in samples]
-    length_mean = np.mean(lengths)
-    length_std = np.std(lengths)
-    print("samples=%d length=%.3fs±%.3fs" % (num_positive, float(length_mean)/sample_rate, float(length_std)/sample_rate))
+    lengths = np.array([b-a for (_, _, a, b) in samples])
+    print("samples=%d length=%.3fs±%.3fs" % (num_positive, float(np.mean(lengths))/sample_rate, float(np.std(lengths))/sample_rate))
     for i in range(num_negative):
         # find negative sample randomly in audio file that doesn't overlap with other samples
         sample_pos = np.random.random()  # [0,1)
-        sample_length = int(np.random.normal(length_mean, length_std) + 0.5)
-        if sample_length <= 0:
-            print("WARNING: random sample_length is negative for negative sample, are samples very short?")
+        sample_length = int(np.random.normal(np.mean(lengths), np.std(lengths)/2) + 0.5)
+        if sample_length <= 1:
+            print("WARNING: random sample_length is too short for negative sample")
             continue
 
         # find number of available start indices
@@ -161,8 +163,12 @@ def yield_samples(filename_data, metadata):
                 window_type='hamming', frame_length=length, frame_shift=shift,
                 htk_compat=True, channel=-1)
         if fbank.shape[0] != TimeDims or fbank.shape[1] != FreqDims:
-            print("dur",duration, "shift",shift, "length",length, "sample_rate", sample_rate)
-            raise ArithmeticError("unexpected fbank shape %s, expected %s" % (fbank.shape, [TimeDims, FreqDims]))
+            if TimeDims < fbank.shape[0]:
+                half = int(float(fbank.shape[0]-TimeDims)/2.0)
+                fbank = fbank[half:half+TimeDims,:]
+            else:
+                print("n", b-a, "dur", duration, "shift", shift, "length", length, "sample_rate", sample_rate)
+                raise ArithmeticError("unexpected fbank shape %s, expected %s" % (fbank.shape, [TimeDims, FreqDims]))
 
         yield {
             'input': fbank.numpy(),
@@ -275,7 +281,7 @@ if 0 < Epochs:
                 outputs = model(inputs)
                 loss = criterion(outputs, torch.argmax(targets, axis=1))
                 epoch_losses.append(float(loss))
-        val_loss = np.array(epoch_losses).mean()
+        val_loss = np.mean(epoch_losses)
 
         print('%4d/%d   t=%5s   loss=%12g   val_loss=%12g' % (epoch+1, Epochs, dur2str(time.time()-start_time), loss, val_loss))
         if 3600.0 < time.time()-last_save and ModelFilename != '':
@@ -289,21 +295,19 @@ if 0 < Epochs:
 
 # validation
 print('\n--- Validation')
-val_losses = []
 val_outputs = []
 val_targets = []
+val_losses = []
 model.eval()
 with torch.no_grad():
     for i, (inputs, targets) in enumerate(val_dataloader):
         outputs = model(inputs)
-        outputs = torch.sigmoid(outputs)
         loss = criterion(outputs, torch.argmax(targets, axis=1))
 
-        val_losses.append(float(loss))
+        outputs = torch.sigmoid(outputs)
         val_outputs.append(outputs)
         val_targets.append(targets)
-
-print('\n--- Results')
+        val_losses.append(float(loss))
 loss = np.mean(val_losses)
 print('Loss:           %g' % (loss,))
 
