@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import pickle
+import argparse
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -14,34 +15,64 @@ os.environ['TORCH_HOME'] = 'ast/pretrained_models'
 sys.path.insert(1, './ast/src')
 from models import ASTModel
 
+parser = argparse.ArgumentParser("manatee training")
+parser.add_argument("--epochs", help="Number of epochs to run training", type=int, default=0)
+parser.add_argument("--split", help="Training/validation split", type=float, default=0.8)
+parser.add_argument("--batch", help="Batch size", type=int, default=16)
+parser.add_argument("-o", help="Output filename for trained model", type=str, default='model.pth')
+parser.add_argument("data", help="Input filename for preprocessed data", type=str, default='data.pkl')
+args = parser.parse_args()
+
 
 # General settings
-DataFilename = 'data.pkl'
-ModelFilename = '' # 'model-%s.pth'
+DataFilename = args.data
+ModelFilename = args.o
 
-# FFT settings
+# Data settings
 FreqDims = 128
 TimeDims = 32
 WindowOverlap = 0.5
+PositiveSplit = 0.5
 
 # Training settings
-PositiveSplit = 0.5
-TrainSplit = 0.8
-BatchSize = 16
+TrainSplit = args.split
+BatchSize = args.batch
 LearningRate = 5e-5
-Epochs = 1
+#LearningRateEpochStart = 10
+#LearningRateEpochStop = 1000
+#LearningRateEpochStep = 10
+#LearningRateDecay = 0.5
+Epochs = args.epochs
 
 
 def plot_spectrogram(spectrum):
     plt.matshow(spectral, aspect='auto', interpolation='nearest', origin='lower')
     plt.show()
 
+uniq_id = ''.join(random.choice(string.ascii_lowercase + string.ascii_uppercase) for _ in range(6))
+def uniq_model_filename():
+    if ModelFilename == '':
+        return ''
+    idx = ModelFilename.rfind('.')
+    if idx == -1:
+        idx = len(ModelFilename)
+    uniq = '-%s-%s' % (uniq_id, datetime.now().strftime('%Y%m%dT%H%M%S'))
+    return ModelFilename[:idx] + uniq + ModelFilename[idx:]
+
+def dur2str(dur):
+    out = ''
+    units = ['w', 'd', 'h', 'm', 's']
+    scales = [7*24*3600, 24*3600, 3600, 60, 1]
+    for i, unit in enumerate(units):
+        n = dur // scales[i]
+        if 0 < n:
+            out += '%d%s' % (n, unit)
+            dur = dur - n*scales[i]
+    return out
+
 def yield_samples(filename_data, metadata):
     print()
     print('Loading %s' % (filename_data,))
-    num_positive = len(metadata)
-    num_negative = int(float(num_positive)/PositiveSplit + 0.5) - num_positive
-
     signal, sample_rate = torchaudio.load(filename_data)
     if signal.shape[0] != 1:
         print('ERROR: audio file expected with 1 channel, got %d instead' % (filename_data, signal.shape[0]))
@@ -50,7 +81,7 @@ def yield_samples(filename_data, metadata):
 
     # get positive samples
     samples = []
-    for i in range(num_positive):
+    for i in range(len(metadata)):
         a = int(metadata[i,0]*float(sample_rate))
         b = int(metadata[i,1]*float(sample_rate)) + 1
         samples.append((i+1, 1, a, b))
@@ -63,6 +94,9 @@ def yield_samples(filename_data, metadata):
             samples.pop(i)
         else:
             i = i + 1
+
+    num_positive = len(metadata)
+    num_negative = int(float(num_positive)/PositiveSplit + 0.5) - num_positive
 
     # get negative samples randomly
     lengths = [b-a for (_, _, a, b) in samples]
@@ -129,13 +163,15 @@ def yield_samples(filename_data, metadata):
             raise ArithmeticError("unexpected fbank shape %s, expected %s" % (fbank.shape, [TimeDims, FreqDims]))
 
         yield {
-            'class': torch.nn.functional.one_hot(torch.tensor(cls), 2),
-            'data': fbank,
+            'input': fbank.numpy(),
+            'target': torch.nn.functional.one_hot(torch.tensor(cls), 2).numpy(),
         }
 
 if os.path.isfile(DataFilename):
+    print('--- Loading preprocessed data')
     data = pickle.load(open(DataFilename, 'rb'))
 else:
+    print('--- Preprocessing data')
     data = []
     for i in range(1, 21):
         filename_data = f'data/Session{i}/Session{i}.wav'
@@ -144,28 +180,33 @@ else:
         metadata = pd.read_csv(filename_metadata, sep='\t').values
         metadata = metadata[:,3:5]
         data.extend(list(yield_samples(filename_data, metadata)))
+        print()
     if DataFilename != '':
+        print('--- Saving preprocessed data')
         pickle.dump(data, open(DataFilename, 'wb'))
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, data):
+    def __init__(self, data, device=None):
         # normalize dataset
-        fbanks = np.array([sample['data'] for sample in data])
+        fbanks = np.array([sample['input'] for sample in data])
         mean, stddev = fbanks.mean(), fbanks.std()
         for i in range(len(data)):
-            data[i]['data'] = (data[i]['data'] - mean) / (2*stddev)
+            data[i]['input'] = (data[i]['input'] - mean) / (2*stddev)
+            data[i]['input'] = torch.tensor(data[i]['input'], device=device, dtype=torch.float)
+            data[i]['target'] = torch.tensor(data[i]['target'], device=device, dtype=torch.long)
         self.data = data
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        return self.data[idx]['data'], self.data[idx]['class']
+        return self.data[idx]['input'], self.data[idx]['target']
 
 
 # set up data loaders
-print()
-dataset = Dataset(data)
+print('\n--- Loading data')
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+dataset = Dataset(data, device=device)
 
 num_data = len(dataset)
 num_train = round(num_data * TrainSplit)
@@ -180,16 +221,16 @@ val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=BatchSize, 
 
 
 # set up model
+print('\n--- Loading model')
 cwd = os.getcwd()
 os.chdir('./ast/src/models')  # to download pretrained models
 model = ASTModel(label_dim=2,
     fstride=10, tstride=10,
     input_fdim=FreqDims, input_tdim=TimeDims,
     imagenet_pretrain=True, audioset_pretrain=True,
-    model_size='base384')
+    model_size='base384', verbose=False)
 os.chdir(cwd)
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
 
 
@@ -197,83 +238,87 @@ model = model.to(device)
 parameters = [p for p in model.parameters() if p.requires_grad]
 print('Total parameters: %.2f million' % (sum(p.numel() for p in parameters)/1e6,))
 optimizer = torch.optim.Adam(parameters, LearningRate, weight_decay=5e-7, betas=(0.95, 0.999))
+#scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, gamma=LearningRateDecay,
+#        list(range(LearningRateEpochStart, LearningRateEpochStop, LearningRateEpochStep)))
 criterion = torch.nn.CrossEntropyLoss()
 
-#losses = []
-#start_time = time.time()
-#print('Start training: %s' % (start_time,))
-#for epoch in range(Epochs):
-#    # training step
-#    model.train()
-#    epoch_losses = []
-#    for i, (inputs, labels) in enumerate(train_dataloader):
-#        inputs = inputs.to(device, non_blocking=True)
-#        targets = labels.to(device, non_blocking=True)
-#
-#        outputs = model(inputs)
-#        loss = criterion(outputs, torch.argmax(targets, axis=1))
-#
-#        optimizer.zero_grad()
-#        loss.backward()
-#        optimizer.step()
-#
-#        epoch_losses.append(loss.item())
-#    loss = np.array(epoch_losses).mean()
-#
-#    # validation step
-#    model.eval()
-#    epoch_losses = []
-#    with torch.no_grad():
-#        for i, (inputs, labels) in enumerate(val_dataloader):
-#            inputs = inputs.to(device, non_blocking=True)
-#            targets = labels.to(device, non_blocking=True)
-#
-#            outputs = model(inputs)
-#            loss = criterion(outputs, torch.argmax(targets, axis=1))
-#            epoch_losses.append(loss.item())
-#    val_loss = np.array(epoch_losses).mean()
-#
-#    print('epoch=%4d/%d  t=%.1fs  loss=%g  val_loss=%g' % (epoch+1, Epochs, time.time()-start_time, loss, val_loss))
-#print('End training: %s' % (time.time(),))
-if ModelFilename != '':
-    torch.save(model.state_dict(), ModelFilename % (datetime.now().strftime('%Y%m%dT%H%M%S'),))
+if 0 < Epochs:
+    print('\n--- Training')
+    losses = []
+    start_time = time.time()
+    last_save = start_time
+
+    print('Start training: %s' % (datetime.now(),))
+    for epoch in range(Epochs):
+        # training step
+        model.train()
+        epoch_losses = []
+        for i, (inputs, targets) in enumerate(train_dataloader):
+            outputs = model(inputs)
+            loss = criterion(outputs, torch.argmax(targets, axis=1))
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            # scheduler.step()
+
+            epoch_losses.append(float(loss))
+        loss = np.array(epoch_losses).mean()
+
+        # validation step
+        model.eval()
+        epoch_losses = []
+        with torch.no_grad():
+            for i, (inputs, targets) in enumerate(val_dataloader):
+                outputs = model(inputs)
+                loss = criterion(outputs, torch.argmax(targets, axis=1))
+                epoch_losses.append(float(loss))
+        val_loss = np.array(epoch_losses).mean()
+
+        print('%4d/%d   t=%5s   loss=%12g   val_loss=%12g' % (epoch+1, Epochs, dur2str(time.time()-start_time), loss, val_loss))
+        if 3600.0 < time.time()-last_save and ModelFilename != '':
+            torch.save(model.state_dict(), uniq_model_filename())
+            last_save = time.time()
+
+    print('End training: %s' % (datetime.now(),))
+    if ModelFilename != '':
+        torch.save(model.state_dict(), uniq_model_filename())
 
 
 # validation
+print('\n--- Validation')
 val_losses = []
 val_outputs = []
 val_targets = []
 model.eval()
 with torch.no_grad():
-    for i, (inputs, labels) in enumerate(val_dataloader):
-        inputs = inputs.to(device, non_blocking=True)
-        targets = labels.to(device, non_blocking=True)
-
+    for i, (inputs, targets) in enumerate(val_dataloader):
         outputs = model(inputs)
         outputs = torch.sigmoid(outputs)
         loss = criterion(outputs, torch.argmax(targets, axis=1))
 
-        val_losses.append(loss)
+        val_losses.append(float(loss))
         val_outputs.append(outputs)
         val_targets.append(targets)
 
+print('\n--- Results')
 loss = np.mean(val_losses)
-outputs = torch.cat(val_outputs)
-targets = torch.cat(val_targets)
+print('Loss:           %g' % (loss,))
+
+outputs = torch.cat(val_outputs).detach().cpu().numpy()
+targets = torch.cat(val_targets).detach().cpu().numpy()
+acc = metrics.accuracy_score(np.argmax(targets,1), np.argmax(outputs,1))
+print('Accuracy:       %g' % (acc,))
 
 aps = []
 aucs = []
-acc = metrics.accuracy_score(np.argmax(targets,1), np.argmax(outputs,1))
+target_names = ['Negative', 'Positive']
 for cls in range(2):
-    aps.append( metrics.average_precision_score(targets[:,cls], outputs[:,cls], average=None))
+    aps.append(metrics.average_precision_score(targets[:,cls], outputs[:,cls], average=None))
     aucs.append(metrics.roc_auc_score(targets[:,cls], outputs[:,cls], average=None))
-report = metrics.classification_report(np.argmax(targets, axis=1), np.argmax(outputs, axis=1), target_names=['Negative', 'Positive'])
+print('Avg. precision: %g' % (np.mean(aps),))
+print('AUC:            %g' % (np.mean(aucs),))
 
-print()
-print('Results:')
-print('  Loss:           %g' % (loss,))
-print('  Accuracy:       %g' % (acc,))
-print('  Avg. precision: %g' % (np.mean(aps),))
-print('  AUC:            %g' % (np.mean(aucs),))
+report = metrics.classification_report(np.argmax(targets,1), np.argmax(outputs,1), target_names=target_names)
 print()
 print(report)
