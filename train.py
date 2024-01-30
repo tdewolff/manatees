@@ -17,16 +17,21 @@ os.environ['TORCH_HOME'] = 'ast/pretrained_models'
 sys.path.insert(1, './ast/src')
 from models import ASTModel
 
+
+# TODO: zero bands appear in fbank depending on FreqDims and TimeDims
+
+
 parser = argparse.ArgumentParser("manatee training")
 parser.add_argument("--epochs", help="Number of epochs to run training", type=int, default=0)
 parser.add_argument("--split", help="Training/validation split", type=float, default=0.7)
 parser.add_argument("--batch", help="Batch size", type=int, default=16)
-parser.add_argument("--output", help="Output filename for trained model", type=str, default='model.pth')
+parser.add_argument("--lr", help="Initial learning rate", type=float, default=5e-5)
+parser.add_argument("--lr-start", help="Learning rate scheduler epoch start", type=int, default=10)
+parser.add_argument("--lr-step", help="Learning rate scheduler epoch step", type=int, default=5)
+parser.add_argument("--lr-decay", help="Learning rate scheduler step decay", type=float, default=0.5)
+parser.add_argument("--output", help="Output filename for trained model", type=str, default='')
 parser.add_argument("data", nargs='*', help="Input filename for preprocessed data", type=str, default=['data.pkl'])
 args = parser.parse_args()
-
-
-# TODO: zero bands appear in fbank depending on FreqDims and TimeDims
 
 
 # General settings
@@ -42,11 +47,11 @@ PositiveSplit = 0.5
 # Training settings
 TrainSplit = args.split
 BatchSize = args.batch
-LearningRate = 5e-5
-#LearningRateEpochStart = 10
-#LearningRateEpochStop = 1000
-#LearningRateEpochStep = 5
-#LearningRateDecay = 0.5
+LearningRate = args.lr
+LearningRateEpochStart = args.lr_start
+LearningRateEpochStop = 1000
+LearningRateEpochStep = args.lr_step
+LearningRateDecay = args.lr_decay
 Epochs = args.epochs
 
 
@@ -61,7 +66,7 @@ def uniq_model_filename():
     idx = ModelFilename.rfind('.')
     if idx == -1:
         idx = len(ModelFilename)
-    uniq = '-%s-%s' % (uniq_id, datetime.now().strftime('%Y%m%dT%H%M%S'))
+    uniq = '-%s-%s' % (datetime.now().strftime('%Y%m%dT%H%M%S'), uniq_id)
     return ModelFilename[:idx] + uniq + ModelFilename[idx:]
 
 def dur2str(dur):
@@ -246,8 +251,9 @@ model = model.to(device)
 parameters = [p for p in model.parameters() if p.requires_grad]
 print('Total parameters: %.2f million' % (sum(p.numel() for p in parameters)/1e6,))
 optimizer = torch.optim.Adam(parameters, LearningRate, weight_decay=5e-7, betas=(0.95, 0.999))
-#scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, gamma=LearningRateDecay,
-#        list(range(LearningRateEpochStart, LearningRateEpochStop, LearningRateEpochStep)))
+scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+        list(range(LearningRateEpochStart, LearningRateEpochStop, LearningRateEpochStep)),
+        gamma=LearningRateDecay)
 criterion = torch.nn.CrossEntropyLoss()
 
 if 0 < Epochs:
@@ -268,7 +274,6 @@ if 0 < Epochs:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-            # scheduler.step()
 
             epoch_losses.append(float(loss))
         loss = np.array(epoch_losses).mean()
@@ -283,10 +288,11 @@ if 0 < Epochs:
                 epoch_losses.append(float(loss))
         val_loss = np.mean(epoch_losses)
 
-        print('%4d/%d   t=%5s   loss=%12g   val_loss=%12g' % (epoch+1, Epochs, dur2str(time.time()-start_time), loss, val_loss))
+        print('%4d/%d   t=%5s   lr=%g   loss=%12g   val_loss=%12g' % (epoch+1, Epochs, dur2str(time.time()-start_time), scheduler.get_last_lr()[0], loss, val_loss))
         if 3600.0 < time.time()-last_save and ModelFilename != '':
             torch.save(model.state_dict(), uniq_model_filename())
             last_save = time.time()
+        scheduler.step()
 
     print('End training: %s' % (datetime.now(),))
     if ModelFilename != '':
