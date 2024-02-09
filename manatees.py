@@ -1,0 +1,485 @@
+import os
+import sys
+import time
+import glob
+import pickle
+import string
+import random
+import argparse
+from datetime import datetime
+
+import pandas as pd
+import numpy as np
+import torch
+import torchaudio
+from sklearn import metrics
+import matplotlib.pyplot as plt
+
+os.environ['TORCH_HOME'] = 'ast/pretrained_models'
+sys.path.insert(1, './ast/src')
+from models import ASTModel
+
+
+# TODO: zero bands appear in fbank depending on FreqDims and TimeDims
+# TODO: find better negative samples
+# TODO: find more datasets
+# TODO: write eval.py to classify new sample with trained model
+# TODO: manatees use the 3 - 20 kHz range to communicate, limit frequencies to that range?
+# TODO: does it make sense to use the Mel scale since this is not human communication?
+
+
+parser = argparse.ArgumentParser("Manatee model training and evaluation")
+parser.add_argument("--epochs", help="Number of epochs to run training", type=int, default=3)
+parser.add_argument("--split", help="Training/validation split", type=float, default=0.7)
+parser.add_argument("--batch", help="Batch size", type=int, default=16)
+parser.add_argument("--lr", help="Initial learning rate", type=float, default=5e-5)
+parser.add_argument("--lr-start", help="Learning rate scheduler epoch start", type=int, default=10)
+parser.add_argument("--lr-step", help="Learning rate scheduler epoch step", type=int, default=5)
+parser.add_argument("--lr-decay", help="Learning rate scheduler step decay", type=float, default=0.5)
+parser.add_argument("--model", help="Output filename for trained model", type=str, default='model.pth')
+parser.add_argument("--data", nargs='*', help="Input filename for preprocessed training data", type=str, default=['data.pkl'])
+parser.add_argument("--test-data", nargs='*', help="Input filename for preprocessed test data", type=str, default=['test-data.pkl'])
+parser.add_argument("--sound", nargs='*', help="Input filename for sound file for evaluation", type=str, default=[])
+parser.add_argument("cmd", nargs='?', choices=['train', 'test', 'eval'], type=str, default='eval')
+args = parser.parse_args()
+
+
+# General settings
+Cmd = args.cmd
+DataFilename = args.data
+TestDataFilename = args.test_data
+SoundFilename = args.sound
+ModelFilename = args.model
+
+# Data settings
+FreqDims = 64        # increases frequency resolution for each sample's fbank
+TimeDims = 128       # increases time resolution for each sample's fbank
+WindowOverlap = 0.5  # increases FFT window size but near time samples look more alike
+SampleDuration = 1.0 # duration to use for each sample in seconds
+SampleOverlap = 0.5  # overlap between samples for evaluation
+PositiveSplit = 0.5
+
+# Training settings
+TrainSplit = args.split
+BatchSize = args.batch
+LearningRate = args.lr
+LearningRateEpochStart = args.lr_start
+LearningRateEpochStop = 1000
+LearningRateEpochStep = args.lr_step
+LearningRateDecay = args.lr_decay
+Epochs = args.epochs
+
+# Utility functions
+def plot_fbank(fbank):
+    plt.matshow(fbank, aspect='auto', interpolation='nearest', origin='lower')
+    plt.show()
+
+uniq_id = ''.join(random.choice(string.ascii_lowercase) for _ in range(6))
+def uniq_model_filename():
+    if ModelFilename == '':
+        return ''
+    idx = ModelFilename.rfind('.')
+    if idx == -1:
+        idx = len(ModelFilename)
+    uniq = '-%s-%s' % (datetime.now().strftime('%Y%m%dT%H%M%S'), uniq_id)
+    return ModelFilename[:idx] + uniq + ModelFilename[idx:]
+
+def dur2str(dur):
+    out = ''
+    units = ['w', 'd', 'h', 'm']
+    scales = [7*24*3600, 24*3600, 3600, 60]
+    for i, unit in enumerate(units):
+        n = dur // scales[i]
+        if 0 < n:
+            out += '%d%s' % (n, unit)
+            dur = dur - n*scales[i]
+    out += '%ds' % (int(dur+0.5),)
+    return out
+
+def get_fbank(signal, sample_rate, a, b):
+    # calculate window size and shift in milliseconds to have TimeDims steps
+    duration = float(b-a)*1000.0/sample_rate
+    if WindowOverlap < 0.0 or 1.0 <= WindowOverlap:
+        raise ValueError("WindowOverlap must be in [0,1)")
+    shift = duration / (float(TimeDims) - float(WindowOverlap))
+    length = (1.0-float(WindowOverlap))*shift
+
+    # calculate fbank
+    fbank = torchaudio.compliance.kaldi.fbank(
+            signal[:,a:b], sample_frequency=sample_rate, num_mel_bins=FreqDims,
+            window_type='hamming', frame_length=length, frame_shift=shift,
+            htk_compat=True, channel=-1)
+    if fbank.shape[0] != TimeDims or fbank.shape[1] != FreqDims:
+        if TimeDims < fbank.shape[0]:
+            half = int(float(fbank.shape[0]-TimeDims)/2.0)
+            fbank = fbank[half:half+TimeDims,:]
+        else:
+            print("n", b-a, "dur", duration, "shift", shift, "length", length, "sample_rate", sample_rate)
+            raise ArithmeticError("unexpected fbank shape %s, expected %s" % (fbank.shape, [TimeDims, FreqDims]))
+    return fbank.numpy()
+
+def yield_samples(filename_data, metadata=None, train=False):
+    print('Loading %s' % (filename_data,))
+    signal, sample_rate = torchaudio.load(filename_data)
+    if signal.shape[0] != 1:
+        print('ERROR: audio file expected with 1 channel, got %d instead' % (filename_data, signal.shape[0]))
+        return
+    signal = signal - signal.mean()
+
+    samples = []
+    if train:
+        # get positive samples
+        for i in range(len(metadata)):
+            # randomly select range of SampleDuration around the sample
+            start, end = metadata[i,0], metadata[i,1]
+            sample_start = start - (start-end+SampleDuration)*np.random.random()  # [0,1)
+            sample_end = sample_start + SampleDuration
+            a = int(sample_start*float(sample_rate))
+            b = int(sample_end*float(sample_rate)) + 1
+            samples.append((i+1, 1, a, b))
+        samples.sort(key=lambda x: x[2])
+
+        i = 1
+        while i < len(samples):
+            if samples[i][2] < samples[i-1][3]:  # a(cur) < b(prev)
+                print("WARNING: omitting sample %d which overlaps with sample %d" % (samples[i][0], samples[i-1][0]))
+                samples.pop(i)
+            else:
+                i = i + 1
+
+        num_positive = len(samples)
+        num_negative = int(float(num_positive)/PositiveSplit + 0.5) - num_positive
+
+        # get negative samples randomly
+        #lengths = np.array([b-a for (_, _, a, b) in samples])
+        #print("samples=%d length=%.3fs±%.3fs" % (num_positive, float(np.mean(lengths))/sample_rate, float(np.std(lengths))/sample_rate))
+        for i in range(num_negative):
+            # find negative sample randomly in audio file that doesn't overlap with other samples
+            sample_pos = np.random.random()  # [0,1)
+            sample_length = int(SampleDuration*sample_rate) #int(np.random.normal(np.mean(lengths), np.std(lengths)/2) + 0.5)
+            #if sample_length <= 1:
+            #    print("WARNING: random sample_length is too short for negative sample")
+            #    continue
+
+            # find number of available start indices
+            indices_used = sum([sample_length+(b-a) for (_, _, a, b) in samples])
+            indices_available = signal.shape[1]-indices_used
+            if indices_available <= 0:
+                print("NOTICE: could not find space to insert negative sample")
+                continue
+            sample_pos = int(sample_pos*indices_available + 0.5)
+            orig_pos = sample_pos
+
+            # iterate over samples over audio file until we find our position
+            start = 0
+            inserted = False
+            for i, (_, _, a, b) in enumerate(samples):
+                end = a-sample_length
+                if end < start:
+                    # too little space for sample
+                    continue
+                elif start+sample_pos < end:
+                    # found position
+                    samples.insert(i, (0, 0, start+sample_pos, start+sample_pos+sample_length))
+                    inserted = True
+                    break
+
+                sample_pos = sample_pos - (end-start)
+                start = b
+            if not inserted:
+                end = signal.shape[1]
+                if start <= end and start+sample_pos < end:
+                    samples.insert(i, (0, 0, start+sample_pos, start+sample_pos+sample_length))
+                else:
+                    print("NOTICE: could not find space to insert negative sample")
+    else:
+        # calculate sample shift in seconds for a certain duration and desired overlap
+        duration = signal.shape[1]/sample_rate
+        n = int((duration-SampleDuration)/(SampleDuration*SampleOverlap) + 0.5)
+        shift = (duration-SampleDuration)/float(n)
+        for i in range(n):
+            sample_start = i*shift
+            sample_end = sample_start + SampleDuration
+            a = int(sample_start*float(sample_rate))
+            b = int(sample_end*float(sample_rate)) + 1
+
+            cls = None
+            if metadata is not None:
+                cls = 0
+                for j in range(len(metadata)):
+                    start, end = metadata[j,0], metadata[j,1]
+                    a2 = int(start*float(sample_rate))
+                    b2 = int(end*float(sample_rate)) + 1
+                    if a2 < b and a < b2 and 0.5 <= (min(b,b2)-max(a,a2))/(b2-a2):
+                        # atleast half the sample is inside the window
+                        cls = 1
+            samples.append((0, cls, a, b))
+
+    for (_, cls, a, b) in samples:
+        #print("sample cls=%d t=%7.3fs—%7.3fs" % (cls, float(a)/sample_rate, float(b)/sample_rate))
+        yield {
+            'input': get_fbank(signal, sample_rate, a, b),
+            'target': np.array(0) if cls is None else torch.nn.functional.one_hot(torch.tensor(cls), 2).numpy(),
+            'position': [a/sample_rate, b/sample_rate],
+        }
+
+class Dataset(torch.utils.data.Dataset):
+    def __init__(self, data, device=None):
+        # normalize dataset
+        fbanks = np.array([sample['input'] for sample in data])
+        mean, stddev = fbanks.mean(), fbanks.std()
+        for i in range(len(data)):
+            data[i]['input'] = (data[i]['input'] - mean) / (2*stddev)
+            data[i]['input'] = torch.tensor(data[i]['input'], device=device, dtype=torch.float)
+            data[i]['target'] = torch.tensor(data[i]['target'], device=device, dtype=torch.long)
+
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+def load_model(filename, device):
+    print('\n--- Loading model')
+    cwd = os.getcwd()
+    os.chdir('./ast/src/models')  # to download pretrained models
+    model = ASTModel(label_dim=2,
+        fstride=10, tstride=10,
+        input_fdim=FreqDims, input_tdim=TimeDims,
+        imagenet_pretrain=True, audioset_pretrain=True,
+        model_size='base384', verbose=False)
+    os.chdir(cwd)
+
+    if Cmd != 'train':
+        if not os.path.isfile(filename):
+            # find last trained model with datetime/uniqid in filename
+            idx = filename.rfind('.')
+            if idx == -1:
+                idx = len(filename)
+            models = glob.glob(filename[:idx] + '-*-*' + filename[idx:])
+            if len(models) == 0:
+                print("ERROR: model filename '%s' doesn\'t exist, you must first train a model" % (filename,))
+                exit(1)
+            models.sort(reverse=True)
+            filename = models[0]
+        model.load_state_dict(torch.load(filename))
+    model = model.to(device)
+    return model
+
+def report(model, criterion, dataloader):
+    val_outputs = []
+    val_targets = []
+    val_losses = []
+    with torch.no_grad():
+        n = len(dataloader)
+        start_time = time.time()
+        last_print = start_time
+        print('Start: %s' % (datetime.now(),))
+        for i, sample in enumerate(dataloader):
+            inputs = sample['input']
+            targets = sample['target']
+
+            outputs = model(inputs)
+            loss = criterion(outputs, torch.argmax(targets, axis=1))
+
+            outputs = torch.sigmoid(outputs)
+            val_outputs.append(outputs)
+            val_targets.append(targets)
+            val_losses.append(float(loss))
+
+            if 15.0 < time.time()-last_print:
+                print('%6d/%d   t=%5s' % (i+1, n, dur2str(time.time()-start_time)))
+                last_print = time.time()
+        print('End: %s' % (datetime.now(),))
+    loss = np.mean(val_losses)
+    print('Loss:           %g' % (loss,))
+
+    outputs = torch.cat(val_outputs).detach().cpu().numpy()
+    targets = torch.cat(val_targets).detach().cpu().numpy()
+    acc = metrics.accuracy_score(np.argmax(targets,1), np.argmax(outputs,1))
+    print('Accuracy:       %g' % (acc,))
+
+    aps = []
+    aucs = []
+    target_names = ['Negative', 'Positive']
+    for cls in range(2):
+        aps.append(metrics.average_precision_score(targets[:,cls], outputs[:,cls], average=None))
+        aucs.append(metrics.roc_auc_score(targets[:,cls], outputs[:,cls], average=None))
+    print('Avg. precision: %g' % (np.mean(aps),))
+    print('AUC:            %g' % (np.mean(aucs),))
+
+    report = metrics.classification_report(np.argmax(targets,1), np.argmax(outputs,1), target_names=target_names)
+    print()
+    print(report)
+
+
+#########################################################################
+#########################################################################
+#########################################################################
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+criterion = torch.nn.CrossEntropyLoss()
+
+if Cmd == 'train':
+    # load data
+    if len(DataFilename) != 1 or os.path.isfile(DataFilename[0]):
+        print('--- Loading preprocessed data')
+        data = [sample for filename in DataFilename for sample in pickle.load(open(filename, 'rb'))]
+    else:
+        print('--- Preprocessing data')
+        data = []
+        for i in range(1, 21):
+            filename_data = f'data/Session{i}/Session{i}.wav'
+            filename_metadata = f'data/Session{i}/Session{i}.Table.1.selections.txt'
+            metadata = pd.read_csv(filename_metadata, sep='\t').values
+            metadata = metadata[:,3:5]
+            data.extend(list(yield_samples(filename_data, metadata, train=True)))
+        if DataFilename[0] != '':
+            print('\n--- Saving preprocessed data')
+            pickle.dump(data, open(DataFilename[0], 'wb'))
+
+    # set up data loaders
+    print('\n--- Loading data')
+    dataset = Dataset(data, device=device)
+
+    num_data = len(dataset)
+    num_train = round(num_data * TrainSplit)
+    num_val = num_data - num_train
+    if num_val == 0:
+        raise ValueError('validation set is empty')
+    print('Total samples: all=%d  train=%d  validation=%d' % (len(dataset), num_train, num_val))
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [num_train, num_val])
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=BatchSize, shuffle=True)
+    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=BatchSize, shuffle=False)
+
+    # load model
+    model = load_model(ModelFilename, device)
+
+    # training
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    print('Total parameters: %.2f million' % (sum(p.numel() for p in parameters)/1e6,))
+    optimizer = torch.optim.Adam(parameters, LearningRate, weight_decay=5e-7, betas=(0.95, 0.999))
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+            list(range(LearningRateEpochStart, LearningRateEpochStop, LearningRateEpochStep)),
+            gamma=LearningRateDecay)
+
+    if 0 < Epochs:
+        print('\n--- Training')
+        losses = []
+        start_time = time.time()
+        last_save = start_time
+
+        print('Start: %s' % (datetime.now(),))
+        for epoch in range(Epochs):
+            # training step
+            model.train()
+            epoch_losses = []
+            for i, sample in enumerate(train_dataloader):
+                inputs = sample['input']
+                targets = sample['target']
+
+                outputs = model(inputs)
+                loss = criterion(outputs, torch.argmax(targets, axis=1))
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+
+                epoch_losses.append(float(loss))
+            loss = np.array(epoch_losses).mean()
+
+            # validation step
+            model.eval()
+            epoch_losses = []
+            with torch.no_grad():
+                for i, sample in enumerate(val_dataloader):
+                    inputs = sample['input']
+                    targets = sample['target']
+
+                    outputs = model(inputs)
+                    loss = criterion(outputs, torch.argmax(targets, axis=1))
+                    epoch_losses.append(float(loss))
+            val_loss = np.mean(epoch_losses)
+
+            print('%4d/%d   t=%5s   lr=%g   loss=%12g   val_loss=%12g' % (epoch+1, Epochs, dur2str(time.time()-start_time), scheduler.get_last_lr()[0], loss, val_loss))
+            if 3600.0 < time.time()-last_save and ModelFilename != '':
+                torch.save(model.state_dict(), uniq_model_filename())
+                last_save = time.time()
+            scheduler.step()
+
+        print('End: %s' % (datetime.now(),))
+        if ModelFilename != '':
+            torch.save(model.state_dict(), uniq_model_filename())
+
+    # validation
+    print('\n--- Validation')
+    model.eval()
+    report(model, criterion, val_dataloader)
+
+if Cmd == 'test':
+    # load data
+    if len(TestDataFilename) != 1 or os.path.isfile(TestDataFilename[0]):
+        print('--- Loading preprocessed data')
+        data = [sample for filename in TestDataFilename for sample in pickle.load(open(filename, 'rb'))]
+    else:
+        print('--- Preprocessing data')
+        data = []
+        for i in range(1, 21):
+            filename_data = f'data/Session{i}/Session{i}.wav'
+            filename_metadata = f'data/Session{i}/Session{i}.Table.1.selections.txt'
+            metadata = pd.read_csv(filename_metadata, sep='\t').values
+            metadata = metadata[:,3:5]
+            data.extend(list(yield_samples(filename_data, metadata)))
+        if TestDataFilename[0] != '':
+            print('\n--- Saving preprocessed data')
+            pickle.dump(data, open(TestDataFilename[0], 'wb'))
+
+    # set up data loaders
+    print('\n--- Loading data')
+    dataset = Dataset(data, device=device)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize, shuffle=False)
+
+    # load model
+    model = load_model(ModelFilename, device)
+    model.eval()
+
+    print('\n--- Testing')
+    report(model, criterion, dataloader)
+
+if Cmd == 'eval':
+    # load model
+    model = load_model(ModelFilename, device)
+    model.eval()
+
+    # load data
+    print('--- Preprocessing data')
+    data = []
+    if len(SoundFilename) == 0:
+        print("ERROR: no input sound filenames specified with --sound")
+        exit(1)
+    for sound in SoundFilename:
+        data.extend(list(yield_samples(sound)))
+
+    # set up data loaders
+    print('\n--- Loading data')
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    dataset = Dataset(data, device=device)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize, shuffle=False)
+
+    print('\n--- Evaluating')
+    n = 0
+    with torch.no_grad():
+        for i, sample in enumerate(dataloader):
+            inputs = sample['input']
+            positions = sample['position']
+
+            outputs = model(inputs)
+            outputs = torch.sigmoid(outputs)
+            for output, position in zip(outputs, positions):
+                if np.argmax(output) == 1:
+                    print('Manatee call at %s—%s' % (dur2str((position[0]+position[1])/2.0),))
+                    n = n + 1
+    print('%d manatee calls found' % (n,))

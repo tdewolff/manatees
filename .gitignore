@@ -1,3 +1,4 @@
 data/
 *.pkl
 *.pth
+__pycache__/
