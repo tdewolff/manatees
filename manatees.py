@@ -3,8 +3,6 @@ import sys
 import time
 import glob
 import pickle
-import string
-import random
 import argparse
 from datetime import datetime
 
@@ -20,11 +18,7 @@ sys.path.insert(1, './ast/src')
 from models import ASTModel
 
 
-# TODO: zero bands appear in fbank depending on FreqDims and TimeDims
-# TODO: find better negative samples
 # TODO: find more datasets
-# TODO: write eval.py to classify new sample with trained model
-# TODO: manatees use the 3 - 20 kHz range to communicate, limit frequencies to that range?
 # TODO: does it make sense to use the Mel scale since this is not human communication?
 
 
@@ -32,13 +26,15 @@ parser = argparse.ArgumentParser("Manatee model training and evaluation")
 parser.add_argument("--epochs", help="Number of epochs to run training", type=int, default=3)
 parser.add_argument("--split", help="Training/validation split", type=float, default=0.7)
 parser.add_argument("--batch", help="Batch size", type=int, default=16)
-parser.add_argument("--lr", help="Initial learning rate", type=float, default=5e-5)
-parser.add_argument("--lr-start", help="Learning rate scheduler epoch start", type=int, default=10)
+parser.add_argument("--lr", help="Initial learning rate", type=float, default=1e-6)
+parser.add_argument("--lr-start", help="Learning rate scheduler epoch start", type=int, default=5)
 parser.add_argument("--lr-step", help="Learning rate scheduler epoch step", type=int, default=5)
 parser.add_argument("--lr-decay", help="Learning rate scheduler step decay", type=float, default=0.5)
 parser.add_argument("--model", help="Output filename for trained model", type=str, default='model.pth')
-parser.add_argument("--data", nargs='*', help="Input filename for preprocessed training data", type=str, default=['data.pkl'])
-parser.add_argument("--test-data", nargs='*', help="Input filename for preprocessed test data", type=str, default=['test-data.pkl'])
+parser.add_argument("--pos-split", help="Percentage of positive samples (by adding negative samples)", type=float, default=0.5)
+parser.add_argument("--aug-split", help="Percentage of augmented samples", type=float, default=0.0)
+parser.add_argument("--data", nargs='*', help="Input filename for preprocessed training data", type=str, default=['data-train.pkl'])
+parser.add_argument("--test-data", nargs='*', help="Input filename for preprocessed test data", type=str, default=['data-all.pkl'])
 parser.add_argument("--sound", nargs='*', help="Input filename for sound file for evaluation", type=str, default=[])
 parser.add_argument("cmd", nargs='?', choices=['train', 'test', 'eval'], type=str, default='eval')
 args = parser.parse_args()
@@ -52,12 +48,14 @@ SoundFilename = args.sound
 ModelFilename = args.model
 
 # Data settings
-FreqDims = 64        # increases frequency resolution for each sample's fbank
-TimeDims = 128       # increases time resolution for each sample's fbank
-WindowOverlap = 0.5  # increases FFT window size but near time samples look more alike
-SampleDuration = 1.0 # duration to use for each sample in seconds
-SampleOverlap = 0.5  # overlap between samples for evaluation
-PositiveSplit = 0.5
+FreqDims = 64           # increases frequency resolution for each sample's fbank
+TimeDims = 128          # increases time resolution for each sample's fbank
+WindowOverlap = 0.5     # increases FFT window size but near time samples look more alike
+SampleDuration = 1.0    # duration to use for each sample in seconds
+SampleOverlap = 0.5     # overlap between samples for evaluation
+PositiveSplit = args.pos_split     # part of the data set that is a positive sample
+AugmentedSplit = args.aug_split    # part of the positive data set that is augmented
+#AugmentationFilters = ['wave_volume', 'wave_noise']
 
 # Training settings
 TrainSplit = args.split
@@ -69,20 +67,19 @@ LearningRateEpochStep = args.lr_step
 LearningRateDecay = args.lr_decay
 Epochs = args.epochs
 
-# Utility functions
-def plot_fbank(fbank):
-    plt.matshow(fbank, aspect='auto', interpolation='nearest', origin='lower')
-    plt.show()
+if abs(PositiveSplit) < 1e-6:
+    print('ERROR: PositiveSplit is too low')
+    exit(1)
 
-uniq_id = ''.join(random.choice(string.ascii_lowercase) for _ in range(6))
+# Utility functions
 def uniq_model_filename():
     if ModelFilename == '':
         return ''
     idx = ModelFilename.rfind('.')
     if idx == -1:
         idx = len(ModelFilename)
-    uniq = '-%s-%s' % (datetime.now().strftime('%Y%m%dT%H%M%S'), uniq_id)
-    return ModelFilename[:idx] + uniq + ModelFilename[idx:]
+    timestamp = '-' + datetime.now().strftime('%Y%m%dT%H%M%S')
+    return ModelFilename[:idx] + timestamp + ModelFilename[idx:]
 
 def dur2str(dur):
     out = ''
@@ -96,131 +93,124 @@ def dur2str(dur):
     out += '%ds' % (int(dur+0.5),)
     return out
 
-def get_fbank(signal, sample_rate, a, b):
+def get_fbank(signal, sample_rate):
     # calculate window size and shift in milliseconds to have TimeDims steps
-    duration = float(b-a)*1000.0/sample_rate
+    duration = float(signal.shape[1])*1000.0/sample_rate
     if WindowOverlap < 0.0 or 1.0 <= WindowOverlap:
         raise ValueError("WindowOverlap must be in [0,1)")
     shift = duration / (float(TimeDims) - float(WindowOverlap))
     length = (1.0-float(WindowOverlap))*shift
 
+    # filter on frequencies emitted by manatees
+    low_freq = 2000
+    high_freq = 20000
+
     # calculate fbank
     fbank = torchaudio.compliance.kaldi.fbank(
-            signal[:,a:b], sample_frequency=sample_rate, num_mel_bins=FreqDims,
+            signal, sample_frequency=sample_rate, num_mel_bins=FreqDims,
             window_type='hamming', frame_length=length, frame_shift=shift,
+            low_freq=low_freq, high_freq=high_freq,
             htk_compat=True, channel=-1)
     if fbank.shape[0] != TimeDims or fbank.shape[1] != FreqDims:
         if TimeDims < fbank.shape[0]:
             half = int(float(fbank.shape[0]-TimeDims)/2.0)
             fbank = fbank[half:half+TimeDims,:]
         else:
-            print("n", b-a, "dur", duration, "shift", shift, "length", length, "sample_rate", sample_rate)
             raise ArithmeticError("unexpected fbank shape %s, expected %s" % (fbank.shape, [TimeDims, FreqDims]))
     return fbank.numpy()
 
+def plot_fbank(signal, rate):
+    fbank = get_fbank(signal, rate)
+    plt.matshow(fbank, aspect='auto', interpolation='nearest', origin='lower')
+    plt.show()
+
 def yield_samples(filename_data, metadata=None, train=False):
     print('Loading %s' % (filename_data,))
-    signal, sample_rate = torchaudio.load(filename_data)
+    signal, rate = torchaudio.load(filename_data)
     if signal.shape[0] != 1:
         print('ERROR: audio file expected with 1 channel, got %d instead' % (filename_data, signal.shape[0]))
         return
     signal = signal - signal.mean()
 
-    samples = []
-    if train:
-        # get positive samples
-        for i in range(len(metadata)):
-            # randomly select range of SampleDuration around the sample
-            start, end = metadata[i,0], metadata[i,1]
-            sample_start = start - (start-end+SampleDuration)*np.random.random()  # [0,1)
-            sample_end = sample_start + SampleDuration
-            a = int(sample_start*float(sample_rate))
-            b = int(sample_end*float(sample_rate)) + 1
-            samples.append((i+1, 1, a, b))
-        samples.sort(key=lambda x: x[2])
-
+    # merge overlapping samples
+    if metadata is not None:
         i = 1
-        while i < len(samples):
-            if samples[i][2] < samples[i-1][3]:  # a(cur) < b(prev)
-                print("WARNING: omitting sample %d which overlaps with sample %d" % (samples[i][0], samples[i-1][0]))
-                samples.pop(i)
+        metadata = metadata[metadata[:,0].argsort()] # sort on start time
+        while i < len(metadata):
+            if metadata[i,0] < metadata[i-1,1]:  # start(current) < end(previous)
+                print("INFO: merging overlapping samples %d and %d" % (i-1, i))
+                metadata[i-1,0] = np.min(metadata[i-1:i+1,0])
+                metadata[i-1,1] = np.max(metadata[i-1:i+1,1])
+                metadata = np.delete(metadata, i, axis=0)
             else:
                 i = i + 1
 
-        num_positive = len(samples)
+    # calculate sample shift in seconds for a certain duration and desired overlap
+    duration = signal.shape[1]/rate
+    n = int((duration-SampleDuration)/(SampleDuration*SampleOverlap) + 0.5)
+    shift = (duration-SampleDuration)/float(n)
+
+    # extract positive and negative samples
+    samples = np.empty((n,4))
+    for i in range(n):
+        start = i*shift
+        end = start + SampleDuration
+
+        # extract class when training or testing
+        cls = None
+        if metadata is not None:
+            cls = 0
+            for j in range(len(metadata)):
+                sample_start = metadata[j,0]
+                sample_end = metadata[j,1]
+                if sample_start < end and start < sample_end and 0.5 <= (min(end,sample_end)-max(start,sample_start))/(sample_end-sample_start):
+                    # atleast half the sample is inside the window
+                    cls = 1
+
+        # align with temporal resolution (index into signal)
+        a = np.round(start*rate)
+        b = a + int(SampleDuration*rate + 0.5)
+
+        # use loudness to select louder negative sample more often
+        sample_signal = signal[:,int(a):int(b)]
+        lufs = torchaudio.functional.loudness(sample_signal, rate)
+
+        # add to samples
+        samples[i,:] = [cls, a, b, lufs]
+
+    if train:
+        positives = samples[samples[:,0] == 1,:]
+        negatives = samples[samples[:,0] == 0,:]
+
+        num_positive = len(positives)
         num_negative = int(float(num_positive)/PositiveSplit + 0.5) - num_positive
 
-        # get negative samples randomly
-        #lengths = np.array([b-a for (_, _, a, b) in samples])
-        #print("samples=%d length=%.3fs±%.3fs" % (num_positive, float(np.mean(lengths))/sample_rate, float(np.std(lengths))/sample_rate))
-        for i in range(num_negative):
-            # find negative sample randomly in audio file that doesn't overlap with other samples
-            sample_pos = np.random.random()  # [0,1)
-            sample_length = int(SampleDuration*sample_rate) #int(np.random.normal(np.mean(lengths), np.std(lengths)/2) + 0.5)
-            #if sample_length <= 1:
-            #    print("WARNING: random sample_length is too short for negative sample")
-            #    continue
+        # pick a subset of the negative samples
+        if num_negative < len(negatives):
+            # use loudness to select louder negative sample more often
+            p = negatives[:,3]
+            p = p - np.min(p)
+            p /= np.sum(p)
+            indices = np.random.choice(len(negatives), num_negative, replace=False, p=p)
+            negatives = negatives[indices,:]
+        elif len(negatives) < num_negative:
+            print('WARNING: not enough negative samples to satisfy PositiveSplit=%g' % (PositiveSplit,))
 
-            # find number of available start indices
-            indices_used = sum([sample_length+(b-a) for (_, _, a, b) in samples])
-            indices_available = signal.shape[1]-indices_used
-            if indices_available <= 0:
-                print("NOTICE: could not find space to insert negative sample")
-                continue
-            sample_pos = int(sample_pos*indices_available + 0.5)
-            orig_pos = sample_pos
+        samples = np.concatenate((positives, negatives))
 
-            # iterate over samples over audio file until we find our position
-            start = 0
-            inserted = False
-            for i, (_, _, a, b) in enumerate(samples):
-                end = a-sample_length
-                if end < start:
-                    # too little space for sample
-                    continue
-                elif start+sample_pos < end:
-                    # found position
-                    samples.insert(i, (0, 0, start+sample_pos, start+sample_pos+sample_length))
-                    inserted = True
-                    break
+    # return samples
+    for (cls, a, b, lufs) in samples:
+        sample_signal = signal[:,int(a):int(b)]
+        sample_rate = rate
+        position = (a/sample_rate, b/sample_rate)
 
-                sample_pos = sample_pos - (end-start)
-                start = b
-            if not inserted:
-                end = signal.shape[1]
-                if start <= end and start+sample_pos < end:
-                    samples.insert(i, (0, 0, start+sample_pos, start+sample_pos+sample_length))
-                else:
-                    print("NOTICE: could not find space to insert negative sample")
-    else:
-        # calculate sample shift in seconds for a certain duration and desired overlap
-        duration = signal.shape[1]/sample_rate
-        n = int((duration-SampleDuration)/(SampleDuration*SampleOverlap) + 0.5)
-        shift = (duration-SampleDuration)/float(n)
-        for i in range(n):
-            sample_start = i*shift
-            sample_end = sample_start + SampleDuration
-            a = int(sample_start*float(sample_rate))
-            b = int(sample_end*float(sample_rate)) + 1
+        sample_fbank = get_fbank(sample_signal, sample_rate) 
+        target = np.array(0) if cls is None else torch.nn.functional.one_hot(torch.tensor(int(cls)), 2).numpy()
 
-            cls = None
-            if metadata is not None:
-                cls = 0
-                for j in range(len(metadata)):
-                    start, end = metadata[j,0], metadata[j,1]
-                    a2 = int(start*float(sample_rate))
-                    b2 = int(end*float(sample_rate)) + 1
-                    if a2 < b and a < b2 and 0.5 <= (min(b,b2)-max(a,a2))/(b2-a2):
-                        # atleast half the sample is inside the window
-                        cls = 1
-            samples.append((0, cls, a, b))
-
-    for (_, cls, a, b) in samples:
-        #print("sample cls=%d t=%7.3fs—%7.3fs" % (cls, float(a)/sample_rate, float(b)/sample_rate))
         yield {
-            'input': get_fbank(signal, sample_rate, a, b),
-            'target': np.array(0) if cls is None else torch.nn.functional.one_hot(torch.tensor(cls), 2).numpy(),
-            'position': [a/sample_rate, b/sample_rate],
+            'input': sample_fbank,
+            'target': target,
+            'position': position,
         }
 
 class Dataset(torch.utils.data.Dataset):
@@ -239,7 +229,14 @@ class Dataset(torch.utils.data.Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        sample = self.data[idx]
+        if args.cmd == 'train' and np.random.random() < AugmentedSplit:
+            # augment sample with random noise
+            min_snr = 5.0
+            max_snr = 10.0
+            snr = min_snr + (max_snr-min_snr)*torch.rand(1, device=device)
+            sample['input'] += torch.rand(sample['input'].shape, device=device)/snr
+        return sample
 
 def load_model(filename, device):
     print('\n--- Loading model')
@@ -258,14 +255,18 @@ def load_model(filename, device):
             idx = filename.rfind('.')
             if idx == -1:
                 idx = len(filename)
-            models = glob.glob(filename[:idx] + '-*-*' + filename[idx:])
+            models = glob.glob(filename[:idx] + '-*' + filename[idx:])
             if len(models) == 0:
                 print("ERROR: model filename '%s' doesn\'t exist, you must first train a model" % (filename,))
                 exit(1)
             models.sort(reverse=True)
             filename = models[0]
+        print('Using pretrained model from %s' % (filename,))
         model.load_state_dict(torch.load(filename))
     model = model.to(device)
+
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    print('Total parameters: %.2f million' % (sum(p.numel() for p in parameters)/1e6,))
     return model
 
 def report(model, criterion, dataloader):
@@ -327,9 +328,13 @@ if Cmd == 'train':
     # load data
     if len(DataFilename) != 1 or os.path.isfile(DataFilename[0]):
         print('--- Loading preprocessed data')
-        data = [sample for filename in DataFilename for sample in pickle.load(open(filename, 'rb'))]
+        data = []
+        for filename in DataFilename:
+            print('Loading %s' % (filename,))
+            data.extend(pickle.load(open(filename, 'rb')))
     else:
         print('--- Preprocessing data')
+        print('PositiveSplit:', PositiveSplit)
         data = []
         for i in range(1, 21):
             filename_data = f'data/Session{i}/Session{i}.wav'
@@ -350,7 +355,12 @@ if Cmd == 'train':
     num_val = num_data - num_train
     if num_val == 0:
         raise ValueError('validation set is empty')
-    print('Total samples: all=%d  train=%d  validation=%d' % (len(dataset), num_train, num_val))
+
+    num_pos = sum([torch.argmax(sample['target']) == 1 for sample in dataset])
+    num_neg = num_data - num_pos
+    print('AugmentedSplit:', AugmentedSplit)
+    print('Total samples: all=%d  train/val=%d/%d  pos/neg=%d/%d' % (len(dataset), num_train, num_val, num_pos, num_neg))
+
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [num_train, num_val])
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=BatchSize, shuffle=True)
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=BatchSize, shuffle=False)
@@ -360,7 +370,6 @@ if Cmd == 'train':
 
     # training
     parameters = [p for p in model.parameters() if p.requires_grad]
-    print('Total parameters: %.2f million' % (sum(p.numel() for p in parameters)/1e6,))
     optimizer = torch.optim.Adam(parameters, LearningRate, weight_decay=5e-7, betas=(0.95, 0.999))
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
             list(range(LearningRateEpochStart, LearningRateEpochStop, LearningRateEpochStep)),
@@ -373,7 +382,7 @@ if Cmd == 'train':
         last_save = start_time
 
         print('Start: %s' % (datetime.now(),))
-        for epoch in range(Epochs):
+        for epoch in range(Epochs+1):
             # training step
             model.train()
             epoch_losses = []
@@ -384,9 +393,10 @@ if Cmd == 'train':
                 outputs = model(inputs)
                 loss = criterion(outputs, torch.argmax(targets, axis=1))
 
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                if 0 < epoch:
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizer.step()
 
                 epoch_losses.append(float(loss))
             loss = np.array(epoch_losses).mean()
@@ -404,11 +414,12 @@ if Cmd == 'train':
                     epoch_losses.append(float(loss))
             val_loss = np.mean(epoch_losses)
 
-            print('%4d/%d   t=%5s   lr=%g   loss=%12g   val_loss=%12g' % (epoch+1, Epochs, dur2str(time.time()-start_time), scheduler.get_last_lr()[0], loss, val_loss))
+            print('%4d/%d   t=%5s   lr=%g   loss=%12g   val_loss=%12g' % (epoch, Epochs, dur2str(time.time()-start_time), scheduler.get_last_lr()[0], loss, val_loss))
             if 3600.0 < time.time()-last_save and ModelFilename != '':
                 torch.save(model.state_dict(), uniq_model_filename())
                 last_save = time.time()
-            scheduler.step()
+            if 0 < epoch:
+                scheduler.step()
 
         print('End: %s' % (datetime.now(),))
         if ModelFilename != '':
@@ -423,7 +434,10 @@ if Cmd == 'test':
     # load data
     if len(TestDataFilename) != 1 or os.path.isfile(TestDataFilename[0]):
         print('--- Loading preprocessed data')
-        data = [sample for filename in TestDataFilename for sample in pickle.load(open(filename, 'rb'))]
+        data = []
+        for filename in TestDataFilename:
+            print('Loading %s' % (filename,))
+            data.extend(pickle.load(open(filename, 'rb')))
     else:
         print('--- Preprocessing data')
         data = []
@@ -441,6 +455,11 @@ if Cmd == 'test':
     print('\n--- Loading data')
     dataset = Dataset(data, device=device)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize, shuffle=False)
+
+    num_data = len(dataset)
+    num_pos = sum([torch.argmax(sample['target']) == 1 for sample in dataset])
+    num_neg = num_data - num_pos
+    print('Total samples: all=%d  pos/neg=%d/%d' % (len(dataset), num_pos, num_neg))
 
     # load model
     model = load_model(ModelFilename, device)
@@ -468,6 +487,7 @@ if Cmd == 'eval':
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     dataset = Dataset(data, device=device)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize, shuffle=False)
+    print('Total samples: %d' % (len(dataset),))
 
     print('\n--- Evaluating')
     n = 0
@@ -479,7 +499,7 @@ if Cmd == 'eval':
             outputs = model(inputs)
             outputs = torch.sigmoid(outputs)
             for output, position in zip(outputs, positions):
-                if np.argmax(output) == 1:
+                if torch.argmax(output) == 1:
                     print('Manatee call at %s—%s' % (dur2str((position[0]+position[1])/2.0),))
                     n = n + 1
     print('%d manatee calls found' % (n,))
