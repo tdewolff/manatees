@@ -3,6 +3,7 @@ import sys
 import time
 import glob
 import pickle
+import signal
 import argparse
 from datetime import datetime
 
@@ -16,6 +17,9 @@ import matplotlib.pyplot as plt
 os.environ['TORCH_HOME'] = 'ast/pretrained_models'
 sys.path.insert(1, './ast/src')
 from models import ASTModel
+
+# exit cleanly from ctrl+c
+signal.signal(signal.SIGINT, lambda x, y: sys.exit(1))
 
 
 # TODO: find more datasets
@@ -32,10 +36,11 @@ parser.add_argument("--lr-step", help="Learning rate scheduler epoch step", type
 parser.add_argument("--lr-decay", help="Learning rate scheduler step decay", type=float, default=0.5)
 parser.add_argument("--model", help="Output filename for trained model", type=str, default='model.pth')
 parser.add_argument("--pos-split", help="Percentage of positive samples (by adding negative samples)", type=float, default=0.5)
-parser.add_argument("--aug-split", help="Percentage of augmented samples", type=float, default=0.0)
-parser.add_argument("--data", nargs='*', help="Input filename for preprocessed training data", type=str, default=['data-train.pkl'])
+parser.add_argument("--aug-split", help="Percentage of augmented samples", type=float, default=0.5)
+parser.add_argument("--data", nargs='*', help="Input filename for preprocessed training data", type=str, default=['data-all.pkl'])
 parser.add_argument("--test-data", nargs='*', help="Input filename for preprocessed test data", type=str, default=['data-all.pkl'])
 parser.add_argument("--sound", nargs='*', help="Input filename for sound file for evaluation", type=str, default=[])
+parser.add_argument("--report", help="Report filename", type=str, default='report.pkl')
 parser.add_argument("cmd", nargs='?', choices=['train', 'test', 'eval'], type=str, default='eval')
 args = parser.parse_args()
 
@@ -46,6 +51,7 @@ DataFilename = args.data
 TestDataFilename = args.test_data
 SoundFilename = args.sound
 ModelFilename = args.model
+ReportFilename = args.report
 
 # Data settings
 FreqDims = 64           # increases frequency resolution for each sample's fbank
@@ -72,14 +78,12 @@ if abs(PositiveSplit) < 1e-6:
     exit(1)
 
 # Utility functions
-def uniq_model_filename():
-    if ModelFilename == '':
-        return ''
-    idx = ModelFilename.rfind('.')
+def uniq_filename(filename):
+    idx = filename.rfind('.')
     if idx == -1:
-        idx = len(ModelFilename)
+        idx = len(filename)
     timestamp = '-' + datetime.now().strftime('%Y%m%dT%H%M%S')
-    return ModelFilename[:idx] + timestamp + ModelFilename[idx:]
+    return filename[:idx] + timestamp + filename[idx:]
 
 def dur2str(dur):
     out = ''
@@ -202,10 +206,9 @@ def yield_samples(filename_data, metadata=None, train=False):
     for (cls, a, b, lufs) in samples:
         sample_signal = signal[:,int(a):int(b)]
         sample_rate = rate
-        position = (a/sample_rate, b/sample_rate)
-
         sample_fbank = get_fbank(sample_signal, sample_rate) 
         target = np.array(0) if cls is None else torch.nn.functional.one_hot(torch.tensor(int(cls)), 2).numpy()
+        position = (a/sample_rate, b/sample_rate)
 
         yield {
             'input': sample_fbank,
@@ -269,10 +272,10 @@ def load_model(filename, device):
     print('Total parameters: %.2f million' % (sum(p.numel() for p in parameters)/1e6,))
     return model
 
-def report(model, criterion, dataloader):
-    val_outputs = []
-    val_targets = []
-    val_losses = []
+def report(model, criterion, dataloader, name=''):
+    cum_outputs = []
+    cum_targets = []
+    cum_loss = torch.zeros((), device=device, dtype=float)
     with torch.no_grad():
         n = len(dataloader)
         start_time = time.time()
@@ -281,24 +284,24 @@ def report(model, criterion, dataloader):
         for i, sample in enumerate(dataloader):
             inputs = sample['input']
             targets = sample['target']
+            cum_targets.append(targets)
 
             outputs = model(inputs)
             loss = criterion(outputs, torch.argmax(targets, axis=1))
+            cum_loss += loss.detach()
 
             outputs = torch.sigmoid(outputs)
-            val_outputs.append(outputs)
-            val_targets.append(targets)
-            val_losses.append(float(loss))
+            cum_outputs.append(outputs)
 
             if 15.0 < time.time()-last_print:
                 print('%6d/%d   t=%5s' % (i+1, n, dur2str(time.time()-start_time)))
                 last_print = time.time()
         print('End: %s' % (datetime.now(),))
-    loss = np.mean(val_losses)
+    loss = float(cum_loss)/float(len(dataloader))
     print('Loss:           %g' % (loss,))
 
-    outputs = torch.cat(val_outputs).detach().cpu().numpy()
-    targets = torch.cat(val_targets).detach().cpu().numpy()
+    outputs = torch.cat(cum_outputs).detach().cpu().numpy()
+    targets = torch.cat(cum_targets).detach().cpu().numpy()
     acc = metrics.accuracy_score(np.argmax(targets,1), np.argmax(outputs,1))
     print('Accuracy:       %g' % (acc,))
 
@@ -315,10 +318,24 @@ def report(model, criterion, dataloader):
     print()
     print(report)
 
+    if ReportFilename != '':
+        data = {
+            'outputs': outputs,
+            'targets': targets,
+        }
+        filename = ReportFilename
+        if name != '':
+            idx = filename.rfind('.')
+            if idx == -1:
+                idx = len(filename)
+            filename = filename[:idx] + '-' + name + filename[idx:]
+        pickle.dump(data, open(filename, 'wb'))
+
 
 #########################################################################
 #########################################################################
 #########################################################################
+
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -362,8 +379,17 @@ if Cmd == 'train':
     print('Total samples: all=%d  train/val=%d/%d  pos/neg=%d/%d' % (len(dataset), num_train, num_val, num_pos, num_neg))
 
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [num_train, num_val])
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=BatchSize, shuffle=True)
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=BatchSize, shuffle=False)
+
+    # set up weighted sampler to deal with class imbalance
+    num_train_pos = sum([torch.argmax(sample['target']) == 1 for sample in train_dataset])
+    num_train_neg = len(train_dataset) - num_train_pos
+    weight_pos = 0.5 / float(num_train_pos)
+    weight_neg = 0.5 / float(num_train_neg)
+    sample_weights = torch.tensor([weight_pos if torch.argmax(sample['target']) == 1 else weight_neg for sample in train_dataset])
+    sampler = torch.utils.data.sampler.WeightedRandomSampler(sample_weights, num_samples=len(train_dataset))
+
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=BatchSize, sampler=sampler)
+    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=BatchSize)
 
     # load model
     model = load_model(ModelFilename, device)
@@ -377,33 +403,32 @@ if Cmd == 'train':
 
     if 0 < Epochs:
         print('\n--- Training')
-        losses = []
         start_time = time.time()
         last_save = start_time
+        cum_loss = torch.zeros((), device=device, dtype=float)
 
         print('Start: %s' % (datetime.now(),))
         for epoch in range(Epochs+1):
             # training step
             model.train()
-            epoch_losses = []
+            cum_loss.zero_()
             for i, sample in enumerate(train_dataloader):
                 inputs = sample['input']
                 targets = sample['target']
 
                 outputs = model(inputs)
                 loss = criterion(outputs, torch.argmax(targets, axis=1))
+                cum_loss += loss.detach()
 
                 if 0 < epoch:
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     optimizer.step()
-
-                epoch_losses.append(float(loss))
-            loss = np.array(epoch_losses).mean()
+            train_loss = float(cum_loss)/float(len(train_dataloader))
 
             # validation step
             model.eval()
-            epoch_losses = []
+            cum_loss.zero_()
             with torch.no_grad():
                 for i, sample in enumerate(val_dataloader):
                     inputs = sample['input']
@@ -411,24 +436,34 @@ if Cmd == 'train':
 
                     outputs = model(inputs)
                     loss = criterion(outputs, torch.argmax(targets, axis=1))
-                    epoch_losses.append(float(loss))
-            val_loss = np.mean(epoch_losses)
+                    cum_loss += loss.detach()
+            val_loss = float(cum_loss)/float(len(val_dataloader))
 
-            print('%4d/%d   t=%5s   lr=%g   loss=%12g   val_loss=%12g' % (epoch, Epochs, dur2str(time.time()-start_time), scheduler.get_last_lr()[0], loss, val_loss))
+            print('%4d/%d   t=%5s   lr=%g   loss=%12g   val_loss=%12g' % (epoch, Epochs, dur2str(time.time()-start_time), scheduler.get_last_lr()[0], train_loss, val_loss))
             if 3600.0 < time.time()-last_save and ModelFilename != '':
-                torch.save(model.state_dict(), uniq_model_filename())
+                torch.save(model.state_dict(), uniq_filename(ModelFilename))
                 last_save = time.time()
             if 0 < epoch:
                 scheduler.step()
 
         print('End: %s' % (datetime.now(),))
         if ModelFilename != '':
-            torch.save(model.state_dict(), uniq_model_filename())
+            torch.save(model.state_dict(), uniq_filename(ModelFilename))
+
+    model.eval()
+
+    print('\n--- Training report')
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=BatchSize)
+    report(model, criterion, train_dataloader, 'train')
 
     # validation
-    print('\n--- Validation')
-    model.eval()
-    report(model, criterion, val_dataloader)
+    print('\n--- Validation report')
+    report(model, criterion, val_dataloader, 'val')
+
+    print('\n--- Testing report')
+    dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset])
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize)
+    report(model, criterion, dataloader, 'test')
 
 if Cmd == 'test':
     # load data
@@ -454,7 +489,7 @@ if Cmd == 'test':
     # set up data loaders
     print('\n--- Loading data')
     dataset = Dataset(data, device=device)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize, shuffle=False)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize)
 
     num_data = len(dataset)
     num_pos = sum([torch.argmax(sample['target']) == 1 for sample in dataset])
@@ -465,7 +500,7 @@ if Cmd == 'test':
     model = load_model(ModelFilename, device)
     model.eval()
 
-    print('\n--- Testing')
+    print('\n--- Testing report')
     report(model, criterion, dataloader)
 
 if Cmd == 'eval':
@@ -486,7 +521,7 @@ if Cmd == 'eval':
     print('\n--- Loading data')
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     dataset = Dataset(data, device=device)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize, shuffle=False)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize)
     print('Total samples: %d' % (len(dataset),))
 
     print('\n--- Evaluating')

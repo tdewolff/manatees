@@ -1,0 +1,20 @@
+\documentclass{article}
+
+\begin{document}
+
+\title{Discovery of manatee calls using audio spectrogram transformers}
+\maketitle
+
+\section{Methodology}
+We split the audio data in samples with a duration of one second, each with an overlap of 50\%. If one of the annotated manatee calls is for at least 50\% inside the sample, it is treated as a positive sample. Otherwise it is a negative sample.
+
+The waveform of each sample is converted to a filter bank, which improves learning performance by eliminating noise from the signal and suppressing lower and higher frequencies. We adjust the frame size of filter banks to obtain samples of size $(64,128)$, respectively the number of frequency bins and the number of time bins. Filter banks intrincically use Mel's scale when obtaining the spectrogram, which is a non-linear filter to emphasize more important frequencies. It is however calibrated for the frequency range of human voice, and a more optimal frequency transformation could possibly be found. Since manatees emit frequencies in the range of of 2 — 20 kHz [CITE], we dismiss all other frequencies to quell irrelevant information.
+
+The dataset is highly imbalanced with only 3\% of the samples positive. By using a weighted random sampler we make sure that the negative sample are undersampled while training, improving the precision and recall of the positive class while still learning all negative samples.
+
+To improve the robustness of the model and to prevent it from learning to recognize the sample, we add random noise with a signal-to-noise ratio of 5 — 10 dB and a 50\% chance of applying to a sample for each epoch.
+
+We use 70\% of the data for training and 30\% for validation. Our model is the audio spectrogram tranformer [CITE] pretrained on AudioSet [CITE] and ImageNet [CITE]. We use the cross-entropy loss function and the Adam optimizer, halving the learning rate every 5 epochs starting at 1e-6, and train for 25 epochs (about 1 hour on an Nvidia GeForce GTX 1080).
+
+
+\end{document}
