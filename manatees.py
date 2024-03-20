@@ -31,14 +31,11 @@ parser.add_argument("--epochs", help="Number of epochs to run training", type=in
 parser.add_argument("--split", help="Training/validation split", type=float, default=0.7)
 parser.add_argument("--batch", help="Batch size", type=int, default=16)
 parser.add_argument("--lr", help="Initial learning rate", type=float, default=1e-6)
-parser.add_argument("--lr-start", help="Learning rate scheduler epoch start", type=int, default=5)
 parser.add_argument("--lr-step", help="Learning rate scheduler epoch step", type=int, default=5)
 parser.add_argument("--lr-decay", help="Learning rate scheduler step decay", type=float, default=0.5)
 parser.add_argument("--model", help="Output filename for trained model", type=str, default='model.pth')
 parser.add_argument("--pos-split", help="Percentage of positive samples (by adding negative samples)", type=float, default=0.5)
-parser.add_argument("--aug-split", help="Percentage of augmented samples", type=float, default=0.5)
-parser.add_argument("--data", nargs='*', help="Input filename for preprocessed training data", type=str, default=['data-all.pkl'])
-parser.add_argument("--test-data", nargs='*', help="Input filename for preprocessed test data", type=str, default=['data-all.pkl'])
+parser.add_argument("--data", nargs='*', help="Input filename for preprocessed data", type=str, default=['data.pkl'])
 parser.add_argument("--sound", nargs='*', help="Input filename for sound file for evaluation", type=str, default=[])
 parser.add_argument("--report", help="Report filename", type=str, default='report.pkl')
 parser.add_argument("cmd", nargs='?', choices=['train', 'test', 'eval'], type=str, default='eval')
@@ -48,7 +45,6 @@ args = parser.parse_args()
 # General settings
 Cmd = args.cmd
 DataFilename = args.data
-TestDataFilename = args.test_data
 SoundFilename = args.sound
 ModelFilename = args.model
 ReportFilename = args.report
@@ -60,16 +56,13 @@ WindowOverlap = 0.5     # increases FFT window size but near time samples look m
 SampleDuration = 1.0    # duration to use for each sample in seconds
 SampleOverlap = 0.5     # overlap between samples for evaluation
 PositiveSplit = args.pos_split     # part of the data set that is a positive sample
-AugmentedSplit = args.aug_split    # part of the positive data set that is augmented
-#AugmentationFilters = ['wave_volume', 'wave_noise']
+Balance = False
 
 # Training settings
 TrainSplit = args.split
 BatchSize = args.batch
 LearningRate = args.lr
-LearningRateEpochStart = args.lr_start
-LearningRateEpochStop = 1000
-LearningRateEpochStep = args.lr_step
+LearningRateStep = args.lr_step
 LearningRateDecay = args.lr_decay
 Epochs = args.epochs
 
@@ -102,8 +95,8 @@ def get_fbank(signal, sample_rate):
     duration = float(signal.shape[1])*1000.0/sample_rate
     if WindowOverlap < 0.0 or 1.0 <= WindowOverlap:
         raise ValueError("WindowOverlap must be in [0,1)")
-    shift = duration / (float(TimeDims) - float(WindowOverlap))
-    length = (1.0-float(WindowOverlap))*shift
+    shift = duration / float(TimeDims)
+    length = (1.0 + float(WindowOverlap))*shift
 
     # filter on frequencies emitted by manatees
     low_freq = 2000
@@ -128,7 +121,7 @@ def plot_fbank(signal, rate):
     plt.matshow(fbank, aspect='auto', interpolation='nearest', origin='lower')
     plt.show()
 
-def yield_samples(filename_data, metadata=None, train=False):
+def yield_samples(filename_data, metadata=None, balance=False):
     print('Loading %s' % (filename_data,))
     signal, rate = torchaudio.load(filename_data)
     if signal.shape[0] != 1:
@@ -151,8 +144,9 @@ def yield_samples(filename_data, metadata=None, train=False):
 
     # calculate sample shift in seconds for a certain duration and desired overlap
     duration = signal.shape[1]/rate
-    n = int((duration-SampleDuration)/(SampleDuration*SampleOverlap) + 0.5)
-    shift = (duration-SampleDuration)/float(n)
+    shift = SampleDuration*(1.0-SampleOverlap)
+    n = int((duration-shift)/shift + 0.5)
+    shift = (duration-SampleDuration)/float(n-1)
 
     # extract positive and negative samples
     samples = np.empty((n,4))
@@ -176,13 +170,15 @@ def yield_samples(filename_data, metadata=None, train=False):
         b = a + int(SampleDuration*rate + 0.5)
 
         # use loudness to select louder negative sample more often
+        lufs = None
         sample_signal = signal[:,int(a):int(b)]
-        lufs = torchaudio.functional.loudness(sample_signal, rate)
+        if balance:
+            lufs = torchaudio.functional.loudness(sample_signal, rate)
 
         # add to samples
         samples[i,:] = [cls, a, b, lufs]
 
-    if train:
+    if balance:
         positives = samples[samples[:,0] == 1,:]
         negatives = samples[samples[:,0] == 0,:]
 
@@ -203,7 +199,7 @@ def yield_samples(filename_data, metadata=None, train=False):
         samples = np.concatenate((positives, negatives))
 
     # return samples
-    for (cls, a, b, lufs) in samples:
+    for (cls, a, b, _) in samples:
         sample_signal = signal[:,int(a):int(b)]
         sample_rate = rate
         sample_fbank = get_fbank(sample_signal, sample_rate) 
@@ -232,14 +228,7 @@ class Dataset(torch.utils.data.Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        sample = self.data[idx]
-        if args.cmd == 'train' and np.random.random() < AugmentedSplit:
-            # augment sample with random noise
-            min_snr = 5.0
-            max_snr = 10.0
-            snr = min_snr + (max_snr-min_snr)*torch.rand(1, device=device)
-            sample['input'] += torch.rand(sample['input'].shape, device=device)/snr
-        return sample
+        return self.data[idx]
 
 def load_model(filename, device):
     print('\n--- Loading model')
@@ -294,10 +283,10 @@ def report(model, criterion, dataloader, name=''):
             cum_outputs.append(outputs)
 
             if 15.0 < time.time()-last_print:
-                print('%6d/%d   t=%5s' % (i+1, n, dur2str(time.time()-start_time)))
+                print('%6d/%d   t=%5s' % (i+1, len(dataloader), dur2str(time.time()-start_time)))
                 last_print = time.time()
         print('End: %s' % (datetime.now(),))
-    loss = float(cum_loss)/float(len(dataloader))
+    loss = float(cum_loss)/float(len(dataloader.dataset))
     print('Loss:           %g' % (loss,))
 
     outputs = torch.cat(cum_outputs).detach().cpu().numpy()
@@ -339,7 +328,7 @@ def report(model, criterion, dataloader, name=''):
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-criterion = torch.nn.CrossEntropyLoss()
+criterion = torch.nn.CrossEntropyLoss(reduction='sum')
 
 if Cmd == 'train':
     # load data
@@ -358,7 +347,7 @@ if Cmd == 'train':
             filename_metadata = f'data/Session{i}/Session{i}.Table.1.selections.txt'
             metadata = pd.read_csv(filename_metadata, sep='\t').values
             metadata = metadata[:,3:5]
-            data.extend(list(yield_samples(filename_data, metadata, train=True)))
+            data.extend(list(yield_samples(filename_data, metadata, balance=Balance)))
         if DataFilename[0] != '':
             print('\n--- Saving preprocessed data')
             pickle.dump(data, open(DataFilename[0], 'wb'))
@@ -375,7 +364,6 @@ if Cmd == 'train':
 
     num_pos = sum([torch.argmax(sample['target']) == 1 for sample in dataset])
     num_neg = num_data - num_pos
-    print('AugmentedSplit:', AugmentedSplit)
     print('Total samples: all=%d  train/val=%d/%d  pos/neg=%d/%d' % (len(dataset), num_train, num_val, num_pos, num_neg))
 
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [num_train, num_val])
@@ -383,12 +371,16 @@ if Cmd == 'train':
     # set up weighted sampler to deal with class imbalance
     num_train_pos = sum([torch.argmax(sample['target']) == 1 for sample in train_dataset])
     num_train_neg = len(train_dataset) - num_train_pos
-    weight_pos = 0.5 / float(num_train_pos)
-    weight_neg = 0.5 / float(num_train_neg)
-    sample_weights = torch.tensor([weight_pos if torch.argmax(sample['target']) == 1 else weight_neg for sample in train_dataset])
-    sampler = torch.utils.data.sampler.WeightedRandomSampler(sample_weights, num_samples=len(train_dataset))
+    #weight_pos = 0.5 / float(num_train_pos)
+    #weight_neg = 0.5 / float(num_train_neg)
+    #sample_weights = torch.tensor([weight_pos if torch.argmax(sample['target']) == 1 else weight_neg for sample in train_dataset])
+    #sampler = torch.utils.data.sampler.WeightedRandomSampler(sample_weights, num_samples=len(train_dataset), replacement=False)
 
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=BatchSize, sampler=sampler)
+    # use class weights to deal with class imbalance
+    #weights = torch.tensor([float(num_train_pos) / float(num_train_neg), 1.0], device=device, dtype=torch.half)
+    train_criterion = torch.nn.CrossEntropyLoss(reduction='sum')
+
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=BatchSize, shuffle=True)
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=BatchSize)
 
     # load model
@@ -398,7 +390,7 @@ if Cmd == 'train':
     parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(parameters, LearningRate, weight_decay=5e-7, betas=(0.95, 0.999))
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-            list(range(LearningRateEpochStart, LearningRateEpochStop, LearningRateEpochStep)),
+            list(range(LearningRateStep, 1000, LearningRateStep)),
             gamma=LearningRateDecay)
 
     if 0 < Epochs:
@@ -416,15 +408,23 @@ if Cmd == 'train':
                 inputs = sample['input']
                 targets = sample['target']
 
+                # augment sample with random noise
+                min_snr = 2.0
+                max_snr = 10.0
+                snr = min_snr + (max_snr-min_snr)*np.random.random()
+                inputs += torch.normal(0.0, 1.0/snr, inputs.shape, device=device)
+
+                # calculate loss
                 outputs = model(inputs)
-                loss = criterion(outputs, torch.argmax(targets, axis=1))
+                loss = train_criterion(outputs, torch.argmax(targets, axis=1))
                 cum_loss += loss.detach()
 
+                # update weights
                 if 0 < epoch:
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     optimizer.step()
-            train_loss = float(cum_loss)/float(len(train_dataloader))
+            train_loss = float(cum_loss)/float(len(train_dataloader.dataset))
 
             # validation step
             model.eval()
@@ -437,7 +437,7 @@ if Cmd == 'train':
                     outputs = model(inputs)
                     loss = criterion(outputs, torch.argmax(targets, axis=1))
                     cum_loss += loss.detach()
-            val_loss = float(cum_loss)/float(len(val_dataloader))
+            val_loss = float(cum_loss)/float(len(val_dataloader.dataset))
 
             print('%4d/%d   t=%5s   lr=%g   loss=%12g   val_loss=%12g' % (epoch, Epochs, dur2str(time.time()-start_time), scheduler.get_last_lr()[0], train_loss, val_loss))
             if 3600.0 < time.time()-last_save and ModelFilename != '':
@@ -453,24 +453,23 @@ if Cmd == 'train':
     model.eval()
 
     print('\n--- Training report')
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=BatchSize)
     report(model, criterion, train_dataloader, 'train')
 
     # validation
     print('\n--- Validation report')
     report(model, criterion, val_dataloader, 'val')
 
-    print('\n--- Testing report')
-    dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset])
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize)
-    report(model, criterion, dataloader, 'test')
+    #print('\n--- Testing report')
+    #dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset])
+    #dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize)
+    #report(model, criterion, dataloader, 'test')
 
 if Cmd == 'test':
     # load data
-    if len(TestDataFilename) != 1 or os.path.isfile(TestDataFilename[0]):
+    if len(DataFilename) != 1 or os.path.isfile(DataFilename[0]):
         print('--- Loading preprocessed data')
         data = []
-        for filename in TestDataFilename:
+        for filename in DataFilename:
             print('Loading %s' % (filename,))
             data.extend(pickle.load(open(filename, 'rb')))
     else:
@@ -482,9 +481,9 @@ if Cmd == 'test':
             metadata = pd.read_csv(filename_metadata, sep='\t').values
             metadata = metadata[:,3:5]
             data.extend(list(yield_samples(filename_data, metadata)))
-        if TestDataFilename[0] != '':
+        if DataFilename[0] != '':
             print('\n--- Saving preprocessed data')
-            pickle.dump(data, open(TestDataFilename[0], 'wb'))
+            pickle.dump(data, open(DataFilename[0], 'wb'))
 
     # set up data loaders
     print('\n--- Loading data')
