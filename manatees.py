@@ -50,11 +50,12 @@ ModelFilename = args.model
 ReportFilename = args.report
 
 # Data settings
-FreqDims = 64           # increases frequency resolution for each sample's fbank
-TimeDims = 128          # increases time resolution for each sample's fbank
 WindowOverlap = 0.5     # increases FFT window size but near time samples look more alike
 SampleDuration = 1.0    # duration to use for each sample in seconds
 SampleOverlap = 0.5     # overlap between samples for evaluation
+FreqDims = 64           # increases frequency resolution for each sample's fbank
+TimeDims = 128          # increases time resolution for each sample's fbank
+#TimeDims = int(SampleDuration*102.4 + 0.5)
 PositiveSplit = args.pos_split     # part of the data set that is a positive sample
 Balance = False
 
@@ -100,7 +101,7 @@ def get_fbank(signal, sample_rate):
 
     # filter on frequencies emitted by manatees
     low_freq = 2000
-    high_freq = 20000
+    high_freq = 30000
 
     # calculate fbank
     fbank = torchaudio.compliance.kaldi.fbank(
@@ -218,6 +219,7 @@ class Dataset(torch.utils.data.Dataset):
         fbanks = np.array([sample['input'] for sample in data])
         mean, stddev = fbanks.mean(), fbanks.std()
         for i in range(len(data)):
+            data[i]['index'] = torch.tensor(i, device=device, dtype=torch.long)
             data[i]['input'] = (data[i]['input'] - mean) / (2*stddev)
             data[i]['input'] = torch.tensor(data[i]['input'], device=device, dtype=torch.float)
             data[i]['target'] = torch.tensor(data[i]['target'], device=device, dtype=torch.long)
@@ -261,7 +263,10 @@ def load_model(filename, device):
     print('Total parameters: %.2f million' % (sum(p.numel() for p in parameters)/1e6,))
     return model
 
-def report(model, criterion, dataloader, name=''):
+def report(model, criterion, dataset, name=''):
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize)
+
+    cum_indices = []
     cum_outputs = []
     cum_targets = []
     cum_loss = torch.zeros((), device=device, dtype=float)
@@ -271,8 +276,10 @@ def report(model, criterion, dataloader, name=''):
         last_print = start_time
         print('Start: %s' % (datetime.now(),))
         for i, sample in enumerate(dataloader):
+            indices = sample['index']
             inputs = sample['input']
             targets = sample['target']
+            cum_indices.append(indices)
             cum_targets.append(targets)
 
             outputs = model(inputs)
@@ -289,6 +296,7 @@ def report(model, criterion, dataloader, name=''):
     loss = float(cum_loss)/float(len(dataloader.dataset))
     print('Loss:           %g' % (loss,))
 
+    indices = torch.cat(cum_indices).detach().cpu().numpy()
     outputs = torch.cat(cum_outputs).detach().cpu().numpy()
     targets = torch.cat(cum_targets).detach().cpu().numpy()
     acc = metrics.accuracy_score(np.argmax(targets,1), np.argmax(outputs,1))
@@ -309,6 +317,7 @@ def report(model, criterion, dataloader, name=''):
 
     if ReportFilename != '':
         data = {
+            'indices': indices,
             'outputs': outputs,
             'targets': targets,
         }
@@ -377,8 +386,8 @@ if Cmd == 'train':
     #sampler = torch.utils.data.sampler.WeightedRandomSampler(sample_weights, num_samples=len(train_dataset), replacement=False)
 
     # use class weights to deal with class imbalance
-    #weights = torch.tensor([float(num_train_pos) / float(num_train_neg), 1.0], device=device, dtype=torch.half)
-    train_criterion = torch.nn.CrossEntropyLoss(reduction='sum')
+    weights = torch.tensor([float(num_train_pos) / float(num_train_neg), 1.0], device=device, dtype=torch.half)
+    train_criterion = torch.nn.CrossEntropyLoss(reduction='sum')#, weights=weights)
 
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=BatchSize, shuffle=True)
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=BatchSize)
@@ -439,7 +448,10 @@ if Cmd == 'train':
                     cum_loss += loss.detach()
             val_loss = float(cum_loss)/float(len(val_dataloader.dataset))
 
-            print('%4d/%d   t=%5s   lr=%g   loss=%12g   val_loss=%12g' % (epoch, Epochs, dur2str(time.time()-start_time), scheduler.get_last_lr()[0], train_loss, val_loss))
+            lr = 0.0
+            if 0 < epoch:
+                lr = scheduler.get_last_lr()[0]
+            print('%4d/%d   t=%5s   lr=%g   loss=%12g   val_loss=%12g' % (epoch, Epochs, dur2str(time.time()-start_time), lr, train_loss, val_loss))
             if 3600.0 < time.time()-last_save and ModelFilename != '':
                 torch.save(model.state_dict(), uniq_filename(ModelFilename))
                 last_save = time.time()
@@ -453,11 +465,11 @@ if Cmd == 'train':
     model.eval()
 
     print('\n--- Training report')
-    report(model, criterion, train_dataloader, 'train')
+    report(model, criterion, train_dataset, 'train')
 
     # validation
     print('\n--- Validation report')
-    report(model, criterion, val_dataloader, 'val')
+    report(model, criterion, val_dataset, 'val')
 
     #print('\n--- Testing report')
     #dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset])
