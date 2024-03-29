@@ -96,18 +96,18 @@ def get_fbank(signal, sample_rate):
     duration = float(signal.shape[1])*1000.0/sample_rate
     if WindowOverlap < 0.0 or 1.0 <= WindowOverlap:
         raise ValueError("WindowOverlap must be in [0,1)")
-    shift = duration / float(TimeDims)
-    length = (1.0 + float(WindowOverlap))*shift
+    shift = duration / float(TimeDims + 1)
+    length = shift/(1.0-float(WindowOverlap))
 
     # filter on frequencies emitted by manatees
     low_freq = 2000
-    high_freq = 30000
+    #high_freq = 30000
 
     # calculate fbank
     fbank = torchaudio.compliance.kaldi.fbank(
             signal, sample_frequency=sample_rate, num_mel_bins=FreqDims,
             window_type='hamming', frame_length=length, frame_shift=shift,
-            low_freq=low_freq, high_freq=high_freq,
+            low_freq=low_freq, #high_freq=high_freq,
             htk_compat=True, channel=-1)
     if fbank.shape[0] != TimeDims or fbank.shape[1] != FreqDims:
         if TimeDims < fbank.shape[0]:
