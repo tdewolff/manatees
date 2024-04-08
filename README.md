@@ -9,7 +9,7 @@ python manatee.py train
 
 Note that your must have the Beauval data set in the `data` directory.
 
-Once a model has been trained, you can run using test mode or evaluation mode. Test mode uses pre-processed data to extract key performance metrics of the model (e.g. on a test data set), while evaluation mode will detect manatee vocalisations in a new audio file using the trained model (for example, `python manatee.py eval soundfile.wav`).
+Once a model has been trained, you can run using test mode or evaluation mode. Test mode uses pre-processed data to extract key performance metrics of the model (e.g. on a test data set), while evaluation mode will detect manatee vocalisations in a new audio file using the trained model (for example, `python manatee.py eval --sound soundfile.wav`).
 
 See `python manatee.py --help` for more information:
 
@@ -33,7 +33,7 @@ options:
   --lr-step LR_STEP     Learning rate scheduler epoch step
   --lr-decay LR_DECAY   Learning rate scheduler step decay
   --model MODEL         Output filename for trained model
-  --pos-split POS_SPLIT
+  --positie-split POSITIVE_SPLIT
                         Percentage of positive samples (by adding negative samples)
   --data [DATA ...]     Input filename for preprocessed data
   --sound [SOUND ...]   Input filename for sound file for evaluation

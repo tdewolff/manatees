@@ -34,7 +34,7 @@ parser.add_argument("--lr", help="Initial learning rate", type=float, default=1e
 parser.add_argument("--lr-step", help="Learning rate scheduler epoch step", type=int, default=5)
 parser.add_argument("--lr-decay", help="Learning rate scheduler step decay", type=float, default=0.5)
 parser.add_argument("--model", help="Output filename for trained model", type=str, default='model.pth')
-parser.add_argument("--pos-split", help="Percentage of positive samples (by adding negative samples)", type=float, default=0.5)
+parser.add_argument("--positive-split", help="Percentage of positive samples (by adding negative samples)", type=float, default=0.5)
 parser.add_argument("--data", nargs='*', help="Input filename for preprocessed data", type=str, default=['data.pkl'])
 parser.add_argument("--sound", nargs='*', help="Input filename for sound file for evaluation", type=str, default=[])
 parser.add_argument("--report", help="Report filename", type=str, default='report.pkl')
@@ -57,7 +57,7 @@ FreqDims = 64           # increases frequency resolution for each sample's fbank
 TimeDims = 128          # increases time resolution for each sample's fbank
 MinPortionPositiveSample = 0.6  # minimal portion of a vocalization in sample to consider sample positive
 #TimeDims = int(SampleDuration*102.4 + 0.5)
-PositiveSplit = args.pos_split     # part of the data set that is a positive sample
+PositiveSplit = args.positive_split     # part of the data set that is a positive sample
 Balance = False
 
 # Training settings
