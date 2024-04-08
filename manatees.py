@@ -55,6 +55,7 @@ SampleDuration = 1.0    # duration to use for each sample in seconds
 SampleOverlap = 0.5     # overlap between samples for evaluation
 FreqDims = 64           # increases frequency resolution for each sample's fbank
 TimeDims = 128          # increases time resolution for each sample's fbank
+MinPortionPositiveSample = 0.6  # minimal portion of a vocalization in sample to consider sample positive
 #TimeDims = int(SampleDuration*102.4 + 0.5)
 PositiveSplit = args.pos_split     # part of the data set that is a positive sample
 Balance = False
@@ -162,8 +163,8 @@ def yield_samples(filename_data, metadata=None, balance=False):
             for j in range(len(metadata)):
                 sample_start = metadata[j,0]
                 sample_end = metadata[j,1]
-                if sample_start < end and start < sample_end and 0.5 <= (min(end,sample_end)-max(start,sample_start))/(sample_end-sample_start):
-                    # atleast half the sample is inside the window
+                if sample_start < end and start < sample_end and MinPortionPositiveSample <= (min(end,sample_end)-max(start,sample_start))/(sample_end-sample_start):
+                    # atleast "MinPortionPositiveSample" of the sample is inside the window
                     cls = 1
 
         # align with temporal resolution (index into signal)
@@ -210,6 +211,7 @@ def yield_samples(filename_data, metadata=None, balance=False):
         yield {
             'input': sample_fbank,
             'target': target,
+            'filename': filename_data,
             'position': position,
         }
 
