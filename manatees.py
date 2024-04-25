@@ -38,6 +38,7 @@ parser.add_argument("--positive-split", help="Percentage of positive samples (by
 parser.add_argument("--data", nargs='*', help="Input filename for preprocessed data", type=str, default=['data.pkl'])
 parser.add_argument("--sound", nargs='*', help="Input filename for sound file for evaluation", type=str, default=[])
 parser.add_argument("--report", help="Report filename", type=str, default='report.pkl')
+parser.add_argument("-n", help="Number of times to train", type=int, default=1)
 parser.add_argument("cmd", nargs='?', choices=['train', 'test', 'eval'], type=str, default='eval')
 args = parser.parse_args()
 
@@ -55,7 +56,8 @@ SampleDuration = 1.0    # duration to use for each sample in seconds
 SampleOverlap = 0.5     # overlap between samples for evaluation
 FreqDims = 64           # increases frequency resolution for each sample's fbank
 TimeDims = 128          # increases time resolution for each sample's fbank
-MinPortionPositiveSample = 0.6  # minimal portion of a vocalization in sample to consider sample positive
+MinPortionSamplePositive = 0.1  # minimal portion of SampleDuration a vocalization to consider it positive
+MinPortionPositiveSample = 0.5  # minimal portion of a vocalization within a sample to consider the sample positive
 #TimeDims = int(SampleDuration*102.4 + 0.5)
 PositiveSplit = args.positive_split     # part of the data set that is a positive sample
 Balance = False
@@ -131,13 +133,19 @@ def yield_samples(filename_data, metadata=None, balance=False):
         return
     signal = signal - signal.mean()
 
+    for i in range(metadata.shape[0]):
+        if metadata[i,1] <= metadata[i,0]:
+            print("WARNING: bad start and end time for %s" % (metadata[i,:],))
+        elif 0.8 < (metadata[i,1] - metadata[i,0]):
+            print("WARNING: very long sample for %s" % (metadata[i,:],))
+
     # merge overlapping samples
     if metadata is not None:
         i = 1
         metadata = metadata[metadata[:,0].argsort()] # sort on start time
         while i < len(metadata):
             if metadata[i,0] < metadata[i-1,1]:  # start(current) < end(previous)
-                print("INFO: merging overlapping samples %d and %d" % (i-1, i))
+                print("INFO: merging overlapping samples %.2f-%.2f and %.2f-%.2f" % (metadata[i-1,0], metadata[i-1,1], metadata[i,0], metadata[i,1]))
                 metadata[i-1,0] = np.min(metadata[i-1:i+1,0])
                 metadata[i-1,1] = np.max(metadata[i-1:i+1,1])
                 metadata = np.delete(metadata, i, axis=0)
@@ -163,7 +171,7 @@ def yield_samples(filename_data, metadata=None, balance=False):
             for j in range(len(metadata)):
                 sample_start = metadata[j,0]
                 sample_end = metadata[j,1]
-                if sample_start < end and start < sample_end and MinPortionPositiveSample <= (min(end,sample_end)-max(start,sample_start))/(sample_end-sample_start):
+                if sample_start < end and start < sample_end and (MinPortionSamplePositive <= ((min(end,sample_end)-max(start,sample_start))/(end-start)) or MinPortionPositiveSample <= (min(end,sample_end)-max(start,sample_start))/(sample_end-sample_start)):
                     # atleast "MinPortionPositiveSample" of the sample is inside the window
                     cls = 1
 
@@ -341,7 +349,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 criterion = torch.nn.CrossEntropyLoss(reduction='sum')
 
-if Cmd == 'train':
+if Cmd == 'train' or Cmd == 'test':
     # load data
     if len(DataFilename) != 1 or os.path.isfile(DataFilename[0]):
         print('--- Loading preprocessed data')
@@ -353,16 +361,19 @@ if Cmd == 'train':
         print('--- Preprocessing data')
         print('PositiveSplit:', PositiveSplit)
         data = []
+        metadata_extra = pd.read_csv(f'data/extra.csv', comment='#').values
         for i in range(1, 21):
             filename_data = f'data/Session{i}/Session{i}.wav'
             filename_metadata = f'data/Session{i}/Session{i}.Table.1.selections.txt'
             metadata = pd.read_csv(filename_metadata, sep='\t').values
             metadata = metadata[:,3:5]
+            metadata = np.append(metadata, metadata_extra[metadata_extra[:,0]==i,1:3], axis=0)
             data.extend(list(yield_samples(filename_data, metadata, balance=Balance)))
         if DataFilename[0] != '':
             print('\n--- Saving preprocessed data')
             pickle.dump(data, open(DataFilename[0], 'wb'))
 
+if Cmd == 'train':
     # set up data loaders
     print('\n--- Loading data')
     dataset = Dataset(data, device=device)
@@ -377,128 +388,110 @@ if Cmd == 'train':
     num_neg = num_data - num_pos
     print('Total samples: all=%d  train/val=%d/%d  pos/neg=%d/%d' % (len(dataset), num_train, num_val, num_pos, num_neg))
 
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [num_train, num_val])
+    for run in range(args.n):
+        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [num_train, num_val])
 
-    # set up weighted sampler to deal with class imbalance
-    num_train_pos = sum([torch.argmax(sample['target']) == 1 for sample in train_dataset])
-    num_train_neg = len(train_dataset) - num_train_pos
-    #weight_pos = 0.5 / float(num_train_pos)
-    #weight_neg = 0.5 / float(num_train_neg)
-    #sample_weights = torch.tensor([weight_pos if torch.argmax(sample['target']) == 1 else weight_neg for sample in train_dataset])
-    #sampler = torch.utils.data.sampler.WeightedRandomSampler(sample_weights, num_samples=len(train_dataset), replacement=False)
+        # set up weighted sampler to deal with class imbalance
+        num_train_pos = sum([torch.argmax(sample['target']) == 1 for sample in train_dataset])
+        num_train_neg = len(train_dataset) - num_train_pos
+        #weight_pos = 0.5 / float(num_train_pos)
+        #weight_neg = 0.5 / float(num_train_neg)
+        #sample_weights = torch.tensor([weight_pos if torch.argmax(sample['target']) == 1 else weight_neg for sample in train_dataset])
+        #sampler = torch.utils.data.sampler.WeightedRandomSampler(sample_weights, num_samples=len(train_dataset), replacement=False)
 
-    # use class weights to deal with class imbalance
-    weights = torch.tensor([float(num_train_pos) / float(num_train_neg), 1.0], device=device, dtype=torch.half)
-    train_criterion = torch.nn.CrossEntropyLoss(reduction='sum')#, weights=weights)
+        # use class weights to deal with class imbalance
+        weights = torch.tensor([20.0 * float(num_train_pos) / float(num_train_neg), 1.0], device=device, dtype=torch.half)
+        train_criterion = torch.nn.CrossEntropyLoss(reduction='sum', weight=weights)
 
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=BatchSize, shuffle=True)
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=BatchSize)
+        train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=BatchSize, shuffle=True)
+        val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=BatchSize)
 
-    # load model
-    model = load_model(ModelFilename, device)
+        # load model
+        model = load_model(ModelFilename, device)
 
-    # training
-    parameters = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(parameters, LearningRate, weight_decay=5e-7, betas=(0.95, 0.999))
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-            list(range(LearningRateStep, 1000, LearningRateStep)),
-            gamma=LearningRateDecay)
+        # training
+        parameters = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(parameters, LearningRate, weight_decay=5e-7, betas=(0.95, 0.999))
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+                list(range(LearningRateStep, 1000, LearningRateStep)),
+                gamma=LearningRateDecay)
 
-    if 0 < Epochs:
-        print('\n--- Training')
-        start_time = time.time()
-        last_save = start_time
-        cum_loss = torch.zeros((), device=device, dtype=float)
+        if 0 < Epochs:
+            print('\n--- Training')
+            start_time = time.time()
+            last_save = start_time
+            cum_loss = torch.zeros((), device=device, dtype=float)
 
-        print('Start: %s' % (datetime.now(),))
-        for epoch in range(Epochs+1):
-            # training step
-            model.train()
-            cum_loss.zero_()
-            for i, sample in enumerate(train_dataloader):
-                inputs = sample['input']
-                targets = sample['target']
-
-                # augment sample with random noise
-                min_snr = 2.0
-                max_snr = 10.0
-                snr = min_snr + (max_snr-min_snr)*np.random.random()
-                inputs += torch.normal(0.0, 1.0/snr, inputs.shape, device=device)
-
-                # calculate loss
-                outputs = model(inputs)
-                loss = train_criterion(outputs, torch.argmax(targets, axis=1))
-                cum_loss += loss.detach()
-
-                # update weights
-                if 0 < epoch:
-                    optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    optimizer.step()
-            train_loss = float(cum_loss)/float(len(train_dataloader.dataset))
-
-            # validation step
-            model.eval()
-            cum_loss.zero_()
-            with torch.no_grad():
-                for i, sample in enumerate(val_dataloader):
+            print('Start: %s' % (datetime.now(),))
+            for epoch in range(Epochs+1):
+                # training step
+                model.train()
+                cum_loss.zero_()
+                for i, sample in enumerate(train_dataloader):
                     inputs = sample['input']
                     targets = sample['target']
 
+                    # augment sample with random noise
+                    #min_snr = 2.0
+                    #max_snr = 10.0
+                    snr = 10.0 #min_snr + (max_snr-min_snr)*np.random.random()
+                    inputs += torch.normal(0.0, 1.0/snr, inputs.shape, device=device)
+
+                    # calculate loss
                     outputs = model(inputs)
-                    loss = criterion(outputs, torch.argmax(targets, axis=1))
+                    loss = train_criterion(outputs, torch.argmax(targets, axis=1))
                     cum_loss += loss.detach()
-            val_loss = float(cum_loss)/float(len(val_dataloader.dataset))
 
-            lr = 0.0
-            if 0 < epoch:
-                lr = scheduler.get_last_lr()[0]
-            print('%4d/%d   t=%5s   lr=%g   loss=%12g   val_loss=%12g' % (epoch, Epochs, dur2str(time.time()-start_time), lr, train_loss, val_loss))
-            if 3600.0 < time.time()-last_save and ModelFilename != '':
+                    # update weights
+                    if 0 < epoch:
+                        optimizer.zero_grad(set_to_none=True)
+                        loss.backward()
+                        optimizer.step()
+                train_loss = float(cum_loss)/float(len(train_dataloader.dataset))
+
+                # validation step
+                model.eval()
+                cum_loss.zero_()
+                with torch.no_grad():
+                    for i, sample in enumerate(val_dataloader):
+                        inputs = sample['input']
+                        targets = sample['target']
+
+                        outputs = model(inputs)
+                        loss = criterion(outputs, torch.argmax(targets, axis=1))
+                        cum_loss += loss.detach()
+                val_loss = float(cum_loss)/float(len(val_dataloader.dataset))
+
+                lr = 0.0
+                if 0 < epoch:
+                    lr = scheduler.get_last_lr()[0]
+                print('%4d/%d   t=%5s   lr=%g   loss=%12g   val_loss=%12g' % (epoch, Epochs, dur2str(time.time()-start_time), lr, train_loss, val_loss))
+                if 3600.0 < time.time()-last_save and ModelFilename != '':
+                    torch.save(model.state_dict(), uniq_filename(ModelFilename))
+                    last_save = time.time()
+                if 0 < epoch:
+                    scheduler.step()
+
+            print('End: %s' % (datetime.now(),))
+            if ModelFilename != '':
                 torch.save(model.state_dict(), uniq_filename(ModelFilename))
-                last_save = time.time()
-            if 0 < epoch:
-                scheduler.step()
 
-        print('End: %s' % (datetime.now(),))
-        if ModelFilename != '':
-            torch.save(model.state_dict(), uniq_filename(ModelFilename))
+        model.eval()
 
-    model.eval()
+        print('\n--- Training report')
+        suffix = ('%d' % run) if 0 < args.n else ''
+        report(model, criterion, train_dataset, 'train'+suffix)
 
-    print('\n--- Training report')
-    report(model, criterion, train_dataset, 'train')
+        # validation
+        print('\n--- Validation report')
+        report(model, criterion, val_dataset, 'val'+suffix)
 
-    # validation
-    print('\n--- Validation report')
-    report(model, criterion, val_dataset, 'val')
-
-    #print('\n--- Testing report')
-    #dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset])
-    #dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize)
-    #report(model, criterion, dataloader, 'test')
+        #print('\n--- Testing report')
+        #dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset])
+        #dataloader = torch.utils.data.DataLoader(dataset, batch_size=BatchSize)
+        #report(model, criterion, dataloader, 'test')
 
 if Cmd == 'test':
-    # load data
-    if len(DataFilename) != 1 or os.path.isfile(DataFilename[0]):
-        print('--- Loading preprocessed data')
-        data = []
-        for filename in DataFilename:
-            print('Loading %s' % (filename,))
-            data.extend(pickle.load(open(filename, 'rb')))
-    else:
-        print('--- Preprocessing data')
-        data = []
-        for i in range(1, 21):
-            filename_data = f'data/Session{i}/Session{i}.wav'
-            filename_metadata = f'data/Session{i}/Session{i}.Table.1.selections.txt'
-            metadata = pd.read_csv(filename_metadata, sep='\t').values
-            metadata = metadata[:,3:5]
-            data.extend(list(yield_samples(filename_data, metadata)))
-        if DataFilename[0] != '':
-            print('\n--- Saving preprocessed data')
-            pickle.dump(data, open(DataFilename[0], 'wb'))
-
     # set up data loaders
     print('\n--- Loading data')
     dataset = Dataset(data, device=device)
