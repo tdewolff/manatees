@@ -1,5 +1,5 @@
 # Manatee audio classification
-Detect manatee vocalisations recorded by hydrophones using the [audio spectrogram transformer model](https://github.com/YuanGongND/ast). This code repository accompanies our paper submissions for ICASSP. The project is in collaboration with AI4Climate (C-MINDS) and ECOSUR, and is funded by Google.
+Detect manatee vocalisations recorded by hydrophones using the [audio spectrogram transformer model](https://github.com/YuanGongND/ast). This code repository accompanies our paper **Detection of manatee vocalisations using the Audio Spectrogram Transformer**, accepted at the *IEEE International Workshop on Machine Learning for Signal Processing (MLSP)* 2024. The project is a joint effort of Initiative for Data & AI (Universidad de Chile), AI4Climate (C-MINDS) and ECOSUR, with funding by Google.
 
 ## Usage
 To pre-process the data set and train the model, run:
